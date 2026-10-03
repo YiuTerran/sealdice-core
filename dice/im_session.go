@@ -1601,7 +1601,7 @@ func (s *IMSession) PreTriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *C
 	defer func() {
 		if r := recover(); r != nil {
 			if mctx.LLMBridgeRequest != nil {
-				mctx.LLMBridgeRequest.markFailed()
+				mctx.LLMBridgeRequest.markFailedAt("pretrigger_panic")
 				log.Warnf("OneBot LLM bridge native command failed: source_message_id=%d", mctx.LLMBridgeRequest.sourceMessage)
 				return
 			}
@@ -1651,6 +1651,7 @@ func (s *IMSession) PreTriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *C
 			// fmt.Println("YYYYYYYYY", myuid, mctx.Group != nil)
 			if mctx.Group.IsBot(msg.Sender.UserID, msg.Sender.IsRobot) {
 				if mctx.LLMBridgeRequest != nil {
+					mctx.LLMBridgeRequest.markFailedAt("sender_is_bot")
 					log.Infof("忽略 OneBot LLM bridge 机器人消息: source_message_id=%d", mctx.LLMBridgeRequest.sourceMessage)
 					return
 				}

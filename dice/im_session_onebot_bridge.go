@@ -15,7 +15,7 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 	tracker := msg.LLMBridgeRequest
 	if tracker == nil || ep == nil || s == nil || s.Parent == nil {
 		if tracker != nil {
-			tracker.markFailed()
+			tracker.markFailedAt("missing_execution_context")
 		}
 		return
 	}
@@ -30,7 +30,7 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 		LLMBridgeRequest:    tracker,
 	}
 	if msg.MessageType != "group" && msg.MessageType != "private" {
-		tracker.markFailed()
+		tracker.markFailedAt("unsupported_message_type")
 		return
 	}
 	if msg.MessageType == "group" {
@@ -50,7 +50,7 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 	}
 	mctx.Group, mctx.Player = GetPlayerInfoBySender(mctx, msg)
 	if mctx.Player == nil {
-		tracker.markFailed()
+		tracker.markFailedAt("missing_player")
 		return
 	}
 	if mctx.Group != nil && mctx.Group.System != "" {
@@ -69,36 +69,36 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 
 	cmdArgs := CommandParseNew(mctx, msg)
 	if cmdArgs == nil {
-		tracker.markFailed()
+		tracker.markFailedAt("command_parse_failed")
 		return
 	}
 	command := strings.ToLower(cmdArgs.Command)
 	if _, allowed := onebotBridgeNativeCommands[command]; !allowed {
-		tracker.markFailed()
+		tracker.markFailedAt("command_not_allowed")
 		return
 	}
 	if command == "set" && !isOnebotBridgeRuleSelection(mctx, cmdArgs) {
-		tracker.markFailed()
+		tracker.markFailedAt("set_not_rule_selection")
 		return
 	}
 	banMessage := *msg
 	banMessage.Message = ""
 	if checkBan(mctx, &banMessage) || mctx.PrivilegeLevel == -30 {
-		tracker.markFailed()
+		tracker.markFailedAt("banned_or_denied")
 		return
 	}
 	mctx.CommandID = getNextCommandID()
 	SetTempVars(mctx, msg.Sender.Nickname)
 
 	if !tracker.beginTask() {
-		tracker.markFailed()
+		tracker.markFailedAt("request_already_terminal")
 		return
 	}
 	go func() {
 		defer tracker.finishTask()
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				tracker.markFailed()
+				tracker.markFailedAt("native_command_panic")
 				d.Logger.Warnf("OneBot LLM bridge native command failed: source_message_id=%d", tracker.sourceMessage)
 			}
 		}()

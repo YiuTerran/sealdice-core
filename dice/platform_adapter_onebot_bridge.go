@@ -139,6 +139,7 @@ type onebotBridgeRequestTracker struct {
 	tasks           int
 	commandSolved   bool
 	failed          bool
+	failureStage    string
 	outputCount     int
 	completionFired bool
 }
@@ -254,6 +255,10 @@ func (r *onebotBridgeRequestTracker) finishTask() {
 	if !r.failed && r.commandSolved {
 		status = "ok"
 	}
+	failureStage := r.failureStage
+	if status == "failed" && failureStage == "" {
+		failureStage = "execution_failed"
+	}
 	params := onebotBridgeCompleteParams{
 		Version:         1,
 		SourceMessageID: r.sourceMessage,
@@ -264,16 +269,26 @@ func (r *onebotBridgeRequestTracker) finishTask() {
 	r.mu.Unlock()
 
 	if shouldComplete {
+		if status == "failed" && r.adapter != nil && r.adapter.logger != nil {
+			r.adapter.logger.Warnf("OneBot LLM bridge request failed: source_message_id=%d stage=%s output_count=%d", r.sourceMessage, failureStage, params.OutputCount)
+		}
 		r.emitCompletion(params)
 	}
 }
 
 func (r *onebotBridgeRequestTracker) markFailed() {
+	r.markFailedAt("execution_failed")
+}
+
+func (r *onebotBridgeRequestTracker) markFailedAt(stage string) {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
 	r.failed = true
+	if r.failureStage == "" {
+		r.failureStage = stage
+	}
 	r.mu.Unlock()
 }
 
@@ -286,6 +301,9 @@ func (r *onebotBridgeRequestTracker) markCommandResult(solved bool) {
 		r.commandSolved = true
 	} else {
 		r.failed = true
+		if r.failureStage == "" {
+			r.failureStage = "native_command_unsolved"
+		}
 	}
 	r.mu.Unlock()
 }
@@ -299,6 +317,9 @@ func (r *onebotBridgeRequestTracker) recordSend(success bool) {
 		r.outputCount++
 	} else {
 		r.failed = true
+		if r.failureStage == "" {
+			r.failureStage = "send_failed"
+		}
 	}
 	r.mu.Unlock()
 }

@@ -140,7 +140,7 @@ func (p *PlatformAdapterOnebot) processOnebotMessageEvent(raw []byte, conn *oneb
 	if err != nil {
 		if p.LLMBridgeEnabled {
 			p.completeMalformedBridgeMessage(conn, raw)
-			p.logger.Warn("OneBot LLM bridge message rejected: malformed event")
+			p.logger.Warn("OneBot LLM bridge message rejected: stage=event_parse_failed")
 			return
 		}
 		p.logger.Errorf("收到消息但无法进行处理，原因为 %s", err)
@@ -153,14 +153,14 @@ func (p *PlatformAdapterOnebot) processOnebotMessageEvent(raw []byte, conn *oneb
 			return
 		}
 		if trackerErr != nil {
-			tracker.markFailed()
+			tracker.markFailedAt("invalid_request_identity")
 			tracker.finishTask()
 			p.logger.Warnf("OneBot LLM bridge message rejected: %s", trackerErr.Error())
 			return
 		}
 		for _, segment := range msg.Segment {
 			if segment.Type() != message.Text {
-				tracker.markFailed()
+				tracker.markFailedAt("unsupported_input_segment")
 				tracker.finishTask()
 				p.logger.Warn("OneBot LLM bridge message rejected: only text input is supported")
 				return
@@ -170,14 +170,14 @@ func (p *PlatformAdapterOnebot) processOnebotMessageEvent(raw []byte, conn *oneb
 		func() {
 			defer func() {
 				if recovered := recover(); recovered != nil {
-					tracker.markFailed()
+					tracker.markFailedAt("message_execution_panic")
 					p.logger.Warnf("OneBot LLM bridge execution failed: source_message_id=%d", tracker.sourceMessage)
 				}
 				tracker.finishTask()
 			}()
 			session := p.EndPoint.Session
 			if session == nil {
-				tracker.markFailed()
+				tracker.markFailedAt("missing_session")
 				return
 			}
 			session.ExecuteNew(p.EndPoint, msg)
@@ -212,6 +212,7 @@ func (p *PlatformAdapterOnebot) completeMalformedBridgeMessage(conn *onebotBridg
 		sourceMessage: messageID,
 		tasks:         1,
 		failed:        true,
+		failureStage:  "malformed_event",
 	}
 	tracker.finishTask()
 }

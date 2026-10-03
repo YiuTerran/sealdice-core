@@ -196,6 +196,63 @@ func TestOnebotBridgeRegistrationRaceAndNativeCompletionAfterSend(t *testing.T) 
 	}
 }
 
+func TestOnebotBridgeFreshDefaultNativeRoll(t *testing.T) {
+	d, _, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+
+	// Model the isolated fresh-volume startup: use the defaults produced by
+	// NewConfig, register only the two verified native rules, and start with an
+	// empty group cache so the first event must create and activate its group.
+	d.onebotBridgeIsolated = true
+	d.onebotBridgeBind = "0.0.0.0:18081"
+	d.onebotBridgeToken = "runtime-only"
+	d.CommandPrefix = NewConfig(d).CommandPrefix
+	d.ExtList = nil
+	d.ExtRegistry = new(SyncMap[string, *ExtInfo])
+	d.registerBuiltinExtForRuntime()
+	d.applyOnebotBridgeIsolation()
+	if len(d.ExtList) != 2 || len(d.Config.ExtDefaultSettings) != 2 {
+		t.Fatalf("fresh bridge fixture registered %d extensions and %d defaults, want two each", len(d.ExtList), len(d.Config.ExtDefaultSettings))
+	}
+	if _, exists := d.ImSession.ServiceAtNew.Load("QQ-Group:22001"); exists {
+		t.Fatal("fresh bridge fixture unexpectedly has a pre-existing group")
+	}
+	var ep *EndPointInfo
+	for _, candidate := range d.ImSession.EndPoints {
+		if adapter, ok := candidate.Adapter.(*PlatformAdapterOnebot); ok && adapter.LLMBridgeEnabled {
+			ep = candidate
+			break
+		}
+	}
+	if ep == nil {
+		t.Fatal("fresh bridge endpoint was not attached")
+	}
+	ep.UserID = "QQ:10000"
+	ep.Nickname = "Bridge"
+
+	em := &onebotBridgeCaptureEmitter{completeCh: make(chan onebotBridgeCompleteParams, 1)}
+	pa := ep.Adapter.(*PlatformAdapterOnebot)
+	pa.logger = d.Logger
+	conn := &onebotBridgeConnection{emitter: em, ctx: context.Background(), registerDone: make(chan struct{})}
+	conn.setRegistration("fresh-default", true)
+	const raw = `{"post_type":"message","message_type":"group","self_id":10000,"user_id":11001,"group_id":22001,"message_id":701,"raw_message":".r 1d1","message":[{"type":"text","data":{"text":".r 1d1"}}],"sender":{"user_id":11001,"nickname":"Player","role":"member"}}`
+	pa.processOnebotMessageEvent([]byte(raw), conn)
+	select {
+	case got := <-em.completeCh:
+		if got.SourceMessageID != 701 || got.ConnectionID != "fresh-default" || got.Status != "ok" || got.OutputCount != 1 {
+			t.Fatalf("fresh default .r 1d1 completion = %#v", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("fresh default .r 1d1 did not complete")
+	}
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	if len(em.sends) != 1 || em.sends[0].audience != "group" || em.sends[0].targetID != 22001 {
+		t.Fatalf("fresh default .r 1d1 sends = %#v", em.sends)
+	}
+	assertOnebotBridgeReply(t, em.sends[0].chain, 701)
+}
+
 func TestOnebotBridgeSplitAndPrivateSendsAreCorrelatedAndOutOfOrderSafe(t *testing.T) {
 	p := &PlatformAdapterOnebot{LLMBridgeEnabled: true, logger: zap.NewNop().Sugar()}
 	oldEmitter := &onebotBridgeCaptureEmitter{completeCh: make(chan onebotBridgeCompleteParams, 1)}
