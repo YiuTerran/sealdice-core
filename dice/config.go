@@ -2582,6 +2582,10 @@ func (d *Dice) Save(isAuto bool) {
 
 	configStartTime := time.Now()
 	if d.LastUpdatedTime != 0 {
+		sessionForSave := d.ImSession
+		if d.onebotBridgeIsolated {
+			sessionForSave = onebotBridgeSessionForSave(d.ImSession)
+		}
 		totalConf := &struct {
 			// copy from Dice
 			ImSession     *IMSession  `jsbind:"imSession"     json:"-"             yaml:"imSession"`
@@ -2592,7 +2596,7 @@ func (d *Dice) Save(isAuto bool) {
 			Config `yaml:",inline"`
 		}{
 			// 这些都是由于导出到 goja 无法拆分的字段
-			d.ImSession,
+			sessionForSave,
 			d.DeckList,
 			d.CommandPrefix,
 			d.DiceMasters,

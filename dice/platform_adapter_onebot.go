@@ -35,7 +35,10 @@ type PlatformAdapterOnebot struct {
 	Mode                string        `json:"mode"                  yaml:"mode"`                  // 什么模式 server是反向，client是正向，http
 	ReverseUrl          string        `json:"reverseUrl"            yaml:"reverseUrl"`            // 反向时 监听地址
 	ReverseSuffix       string        `json:"reverseSuffix"         yaml:"reverseSuffix"`         // 反向时 后缀是什么 默认是/ws
+	LLMBridgeEnabled    bool          `json:"llmBridgeEnabled"      yaml:"llmBridgeEnabled"`      // 启用受限的 OneBot LLM bridge 执行通道
 	IgnoreFriendRequest bool          `json:"ignore_friend_request" yaml:"ignore_friend_request"` // 是否忽略好友请求
+	bridgeRuntimeToken  string        `json:"-"                     yaml:"-"`
+	bridgeRuntimeOnly   bool          `json:"-"                     yaml:"-"`
 	wsmode              string
 	websocketManager    *socketio.SocketInstance
 	ctx                 context.Context
@@ -64,6 +67,11 @@ type PlatformAdapterOnebot struct {
 	connectionMutex sync.Mutex
 	isConnecting    bool // 是否正在建立连接
 
+	bridgeConnectionMu sync.RWMutex
+	bridgeConnections  map[*socketio.WebsocketWrapper]*onebotBridgeConnection
+	bridgeInstanceOnce sync.Once
+	bridgeInstanceID   string
+
 	echoServer *echo.Echo
 
 	sm                  *loopfsm.FSM
@@ -73,6 +81,10 @@ type PlatformAdapterOnebot struct {
 }
 
 func (p *PlatformAdapterOnebot) Serve() int {
+	if p.LLMBridgeEnabled && p.connectionToken() == "" {
+		zap.S().Error("OneBot LLM bridge requires ONEBOT_WS_TOKEN; listener was not started")
+		return 1
+	}
 	p.ensureFSM()
 	p.desiredEnabled = true
 	_ = p.sm.Event(context.Background(), "enable")
@@ -100,6 +112,9 @@ func (p *PlatformAdapterOnebot) SetEnable(enable bool) {
 }
 
 func (p *PlatformAdapterOnebot) QuitGroup(_ *MsgContext, id string) {
+	if p != nil && p.LLMBridgeEnabled {
+		return
+	}
 	if p.sendEmitter != nil {
 		gid := ExtractQQEmitterGroupID(id)
 		err := p.sendEmitter.QuitGroup(p.ctx, gid)
@@ -134,6 +149,12 @@ func (p *PlatformAdapterOnebot) SendToGroup(ctx *MsgContext, groupID string, tex
 }
 
 func (p *PlatformAdapterOnebot) SendGroupForwardMsg(ctx *MsgContext, groupID string, nodes []forwardNode) bool {
+	if p != nil && p.LLMBridgeEnabled {
+		if p.logger != nil {
+			p.logger.Warn("OneBot LLM bridge rejected non-text forward output")
+		}
+		return false
+	}
 	if p == nil || p.sendEmitter == nil {
 		return false
 	}
@@ -176,6 +197,12 @@ func (p *PlatformAdapterOnebot) SendGroupForwardMsg(ctx *MsgContext, groupID str
 }
 
 func (p *PlatformAdapterOnebot) SendPrivateForwardMsg(ctx *MsgContext, userID string, nodes []forwardNode) bool {
+	if p != nil && p.LLMBridgeEnabled {
+		if p.logger != nil {
+			p.logger.Warn("OneBot LLM bridge rejected non-text forward output")
+		}
+		return false
+	}
 	if p == nil || p.sendEmitter == nil {
 		return false
 	}
@@ -217,6 +244,9 @@ func (p *PlatformAdapterOnebot) SendPrivateForwardMsg(ctx *MsgContext, userID st
 }
 
 func (p *PlatformAdapterOnebot) SetGroupCardName(ctx *MsgContext, name string) {
+	if p != nil && p.LLMBridgeEnabled {
+		return
+	}
 	groupID := ctx.Group.GroupID
 	userID := ctx.Player.UserID
 	err := p.sendEmitter.SetGroupCard(p.ctx, ExtractQQEmitterGroupID(groupID), ExtractQQEmitterUserID(userID), name)
@@ -227,6 +257,10 @@ func (p *PlatformAdapterOnebot) SetGroupCardName(ctx *MsgContext, name string) {
 }
 
 func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID string, msg []message.IMessageElement, flag string) {
+	if p != nil && p.LLMBridgeEnabled {
+		p.sendBridgeText(ctx, groupID, "", msg)
+		return
+	}
 	if p == nil || p.sendEmitter == nil {
 		log := zap.S().Named(logger.LogKeyAdapter)
 		if p != nil && p.logger != nil {
@@ -328,6 +362,10 @@ func (p *PlatformAdapterOnebot) SendSegmentToGroup(ctx *MsgContext, groupID stri
 }
 
 func (p *PlatformAdapterOnebot) SendSegmentToPerson(ctx *MsgContext, userID string, msg []message.IMessageElement, flag string) {
+	if p != nil && p.LLMBridgeEnabled {
+		p.sendBridgeText(ctx, "", userID, msg)
+		return
+	}
 	if p == nil || p.sendEmitter == nil {
 		log := zap.S().Named(logger.LogKeyAdapter)
 		if p != nil && p.logger != nil {
@@ -537,9 +575,23 @@ func (p *PlatformAdapterOnebot) isServer() bool {
 // onConnected 连接成功的回调函数
 func (p *PlatformAdapterOnebot) onConnected(kws *socketio.WebsocketWrapper) {
 	// 连接成功，获取当前登录状态
-	p.sendEmitter = emitter.NewEVEmitter(kws)
-	info, err := p.sendEmitter.GetLoginInfo(p.ctx)
+	conn := &onebotBridgeConnection{
+		emitter:      emitter.NewEVEmitter(kws),
+		ctx:          p.ctx,
+		registerDone: make(chan struct{}),
+	}
+	p.bridgeConnectionMu.Lock()
+	if p.bridgeConnections == nil {
+		p.bridgeConnections = make(map[*socketio.WebsocketWrapper]*onebotBridgeConnection)
+	}
+	p.bridgeConnections[kws] = conn
+	p.bridgeConnectionMu.Unlock()
+	if !p.LLMBridgeEnabled {
+		p.sendEmitter = conn.emitter
+	}
+	info, err := conn.emitter.GetLoginInfo(conn.ctx)
 	if err != nil {
+		conn.close()
 		if p.isServer() {
 			// 反向连接：对端未正常响应 GetLoginInfo，说明不可用，关闭本次连接。
 			p.logger.Warnf("[反向WS] 未能获取对端身份信息: %v，关闭连接", err)
@@ -549,6 +601,17 @@ func (p *PlatformAdapterOnebot) onConnected(kws *socketio.WebsocketWrapper) {
 		p.logger.Errorf("获取登录信息异常 %v", err)
 		p.scheduleLoginInfoRetry()
 		return
+	}
+	if p.LLMBridgeEnabled {
+		if err := p.registerLLMBridgeConnection(conn); err != nil {
+			p.logger.Warnf("OneBot LLM bridge registration failed; closing connection: %v", err)
+			conn.close()
+			p.bridgeConnectionMu.Lock()
+			delete(p.bridgeConnections, kws)
+			p.bridgeConnectionMu.Unlock()
+			kws.Close()
+			return
+		}
 	}
 	p.logger.Infof("OneBot 连接成功，账号<%s>(%d)", info.NickName, info.UserId)
 	p.EndPoint.UserID = fmt.Sprintf("QQ:%d", info.UserId)
@@ -574,9 +637,9 @@ func (p *PlatformAdapterOnebot) initializeCommonResources() {
 			if p.isServer() {
 				p.logger.Infof("[反向WS] 收到连接，会话ID: %s", payload.SocketUUID)
 			}
-			if p.Token != "" {
-				token := payload.Kws.GetRequestHeader("Authorization")
-				if !onebotAuthorizationMatches(p.Token, token) {
+			if expectedToken := p.connectionToken(); expectedToken != "" {
+				headerToken := payload.Kws.GetRequestHeader("Authorization")
+				if !onebotAuthorizationMatches(expectedToken, headerToken) {
 					p.logger.Warnf("[反向WS] Token 验证失败，拒绝连接，会话ID: %s", payload.SocketUUID)
 					payload.Kws.Emit([]byte(`{
 						"status": "failed",
@@ -594,6 +657,12 @@ func (p *PlatformAdapterOnebot) initializeCommonResources() {
 			p.onConnected(payload.Kws)
 		})
 		p.websocketManager.On(socketio.EventDisconnect, func(payload *socketio.EventPayload) {
+			p.bridgeConnectionMu.Lock()
+			if conn := p.bridgeConnections[payload.Kws]; conn != nil {
+				conn.close()
+				delete(p.bridgeConnections, payload.Kws)
+			}
+			p.bridgeConnectionMu.Unlock()
 			if p.isServer() {
 				p.logger.Infof("[反向WS] 连接断开，会话ID: %s", payload.SocketUUID)
 			}
@@ -602,6 +671,15 @@ func (p *PlatformAdapterOnebot) initializeCommonResources() {
 			var echoer emitter.Response[sonic.NoCopyRawMessage]
 			if err := sonic.Unmarshal(payload.Data, &echoer); err != nil {
 				p.logger.Errorf("echo 数据传输异常 %v", err)
+			}
+			conn := p.bridgeConnection(payload.Kws)
+			if conn != nil && conn.emitter != nil {
+				conn.emitter.HandleEcho(echoer)
+				return
+			}
+			if p.LLMBridgeEnabled {
+				p.logger.Warn("OneBot LLM bridge echo rejected: connection context is unavailable")
+				return
 			}
 			if p.sendEmitter == nil {
 				p.logger.Warnf("echo 丢弃: emitter=nil echo=%s status=%s retcode=%d", echoer.Echo, echoer.Status, echoer.RetCode)
@@ -673,13 +751,24 @@ func (p *PlatformAdapterOnebot) setupClientConnection() error {
 }
 
 func (p *PlatformAdapterOnebot) applyClientAuthHeader(options *socketio.ClientOptions) {
-	if options == nil || p.Token == "" {
+	token := p.connectionToken()
+	if options == nil || token == "" {
 		return
 	}
 	if options.RequestHeader == nil {
 		options.RequestHeader = http.Header{}
 	}
-	options.RequestHeader.Set("Authorization", p.Token)
+	options.RequestHeader.Set("Authorization", token)
+}
+
+func (p *PlatformAdapterOnebot) connectionToken() string {
+	if p == nil {
+		return ""
+	}
+	if p.LLMBridgeEnabled && p.bridgeRuntimeToken != "" {
+		return p.bridgeRuntimeToken
+	}
+	return p.Token
 }
 
 func onebotAuthorizationMatches(configuredToken, headerValue string) bool {

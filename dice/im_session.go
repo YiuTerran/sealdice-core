@@ -64,7 +64,8 @@ type Message struct {
 	// or legacy mention user ID. It is runtime metadata and is not persisted.
 	MentionedInfo map[string]string `json:"-" yaml:"-"`
 	// Note(Szzrain): 这里是消息段，为了支持多种消息类型，目前只有 Milky 支持，其他平台也应该尽快迁移支持，并使用 Session.ExecuteNew 方法
-	Segment []message.IMessageElement `jsbind:"segment" json:"-" yaml:"-"`
+	Segment          []message.IMessageElement   `jsbind:"segment" json:"-" yaml:"-"`
+	LLMBridgeRequest *onebotBridgeRequestTracker `json:"-" yaml:"-"`
 }
 
 // GroupPlayerInfo 这是一个YamlWrapper，没有实际作用
@@ -868,14 +869,15 @@ type MsgContext struct {
 	Dice            *Dice         // 对应的 Dice
 	IsCurGroupBotOn bool          `jsbind:"isCurGroupBotOn"` // 在群内是否bot on
 
-	IsPrivate       bool        `jsbind:"isPrivate"` // 是否私聊
-	CommandID       int64       // 指令ID
-	CommandHideFlag string      `jsbind:"commandHideFlag"` // 暗骰来源群号
-	CommandInfo     interface{} // 命令信息
-	PrivilegeLevel  int         `jsbind:"privilegeLevel"` // 权限等级 -30ban 40邀请者 50管理 60群主 70信任 100master
-	GroupRoleLevel  int         // 群内权限 40邀请者 50管理 60群主 70信任 100master，相当于不考虑ban的权限等级
-	DelegateText    string      `jsbind:"delegateText"`  // 代骰附加文本
-	AliasPrefixText string      `json:"aliasPrefixText"` // 快捷指令回复前缀文本
+	IsPrivate        bool                        `jsbind:"isPrivate"` // 是否私聊
+	LLMBridgeRequest *onebotBridgeRequestTracker `json:"-"`
+	CommandID        int64                       // 指令ID
+	CommandHideFlag  string                      `jsbind:"commandHideFlag"` // 暗骰来源群号
+	CommandInfo      interface{}                 // 命令信息
+	PrivilegeLevel   int                         `jsbind:"privilegeLevel"` // 权限等级 -30ban 40邀请者 50管理 60群主 70信任 100master
+	GroupRoleLevel   int                         // 群内权限 40邀请者 50管理 60群主 70信任 100master，相当于不考虑ban的权限等级
+	DelegateText     string                      `jsbind:"delegateText"`  // 代骰附加文本
+	AliasPrefixText  string                      `json:"aliasPrefixText"` // 快捷指令回复前缀文本
 
 	deckDepth           int                                         // 抽牌递归深度
 	DeckPools           map[*DeckInfo]map[string]*ShuffleRandomPool // 不放回抽取的缓存
@@ -1309,6 +1311,10 @@ func (s *IMSession) Execute(ep *EndPointInfo, msg *Message, runInSync bool) {
 // 为了避免破坏兼容性，Message.Message 中的内容不会被解析但仍然会赋值
 // 这个 ExcuteNew 方法优化了对消息段的解析，其他平台应当尽快实现消息段解析并使用这个方法
 func (s *IMSession) ExecuteNew(ep *EndPointInfo, msg *Message) {
+	if msg != nil && msg.LLMBridgeRequest != nil {
+		s.executeOnebotBridgeNew(ep, msg)
+		return
+	}
 	d := s.Parent
 
 	mctx := &MsgContext{}
@@ -1594,6 +1600,11 @@ func (s *IMSession) PreTriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *C
 	log := d.Logger
 	defer func() {
 		if r := recover(); r != nil {
+			if mctx.LLMBridgeRequest != nil {
+				mctx.LLMBridgeRequest.markFailed()
+				log.Warnf("OneBot LLM bridge native command failed: source_message_id=%d", mctx.LLMBridgeRequest.sourceMessage)
+				return
+			}
 			//  + fmt.Sprintf("%s", r)
 			log.Errorf("异常: %v 堆栈: %v", r, string(debug.Stack()))
 			ReplyToSender(mctx, msg, DiceFormatTmpl(mctx, "核心:骰子执行异常"))
@@ -1601,7 +1612,7 @@ func (s *IMSession) PreTriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *C
 	}()
 
 	// 敏感词拦截：命令输入
-	if (msg.MessageType == "private" || mctx.IsCurGroupBotOn) && d.Config.EnableCensor && d.Config.CensorMode == OnlyInputCommand {
+	if mctx.LLMBridgeRequest == nil && (msg.MessageType == "private" || mctx.IsCurGroupBotOn) && d.Config.EnableCensor && d.Config.CensorMode == OnlyInputCommand {
 		hit, words, needToTerminate, _ := d.CensorMsg(mctx, msg, msg.Message, "")
 		if needToTerminate {
 			return
@@ -1639,6 +1650,10 @@ func (s *IMSession) PreTriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *C
 		if mctx.MessageType == "group" {
 			// fmt.Println("YYYYYYYYY", myuid, mctx.Group != nil)
 			if mctx.Group.IsBot(msg.Sender.UserID, msg.Sender.IsRobot) {
+				if mctx.LLMBridgeRequest != nil {
+					log.Infof("忽略 OneBot LLM bridge 机器人消息: source_message_id=%d", mctx.LLMBridgeRequest.sourceMessage)
+					return
+				}
 				log.Infof("忽略指令(机器人): 来自群(%s)内<%s>(%s): %s", msg.GroupID, msg.Sender.Nickname, msg.Sender.UserID, msg.Message)
 				return
 			}
@@ -1654,6 +1669,10 @@ func (s *IMSession) PreTriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *C
 				}
 			}
 		}
+	}
+	if mctx.LLMBridgeRequest != nil {
+		ep.TriggerCommandBridge(mctx, msg, cmdArgs)
+		return
 	}
 	ep.TriggerCommand(mctx, msg, cmdArgs)
 }
@@ -1704,6 +1723,23 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 		}
 	}
 	return ret
+}
+
+func (ep *EndPointInfo) TriggerCommandBridge(mctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool {
+	solved := mctx.Session.commandSolveRestricted(mctx, msg, cmdArgs, true)
+	if solved {
+		ep.CmdExecutedNum++
+		ep.CmdExecutedLastTime = time.Now().Unix()
+		if mctx.Player != nil {
+			mctx.Player.LastCommandTime = ep.CmdExecutedLastTime
+			mctx.Player.UpdatedAtTime = time.Now().Unix()
+		}
+		if mctx.Group != nil {
+			mctx.Group.MarkDirty(mctx.Dice)
+		}
+	}
+	mctx.LLMBridgeRequest.markCommandResult(solved)
+	return solved
 }
 
 // OnGroupJoined 群组进群事件处理，其他 Adapter 应当尽快迁移至此方法实现
@@ -2198,6 +2234,10 @@ func checkBan(ctx *MsgContext, msg *Message) (notReply bool) {
 }
 
 func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool {
+	return s.commandSolveRestricted(ctx, msg, cmdArgs, false)
+}
+
+func (s *IMSession) commandSolveRestricted(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs, bridgeOnly bool) bool {
 	// 设置临时变量
 	if ctx.Player != nil {
 		SetTempVars(ctx, msg.Sender.Nickname)
@@ -2208,6 +2248,19 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 	tryItemSolve := func(ext *ExtInfo, item *CmdItemInfo) bool {
 		if item == nil {
 			return false
+		}
+		if bridgeOnly {
+			if item.IsJsSolveFunc {
+				return false
+			}
+			if ext != nil {
+				name := strings.ToLower(ext.Name)
+				command := strings.ToLower(cmdArgs.Command)
+				if ext.IsJsExt || (name != "coc7" && name != "dnd5e") ||
+					(command != "ra" && command != "rc" && command != "st" && command != "sc" && command != "en") {
+					return false
+				}
+			}
 		}
 
 		if item.Raw { //nolint:nestif
@@ -2354,7 +2407,7 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 	}
 
 	solved := builtinSolve()
-	if group.Active || ctx.IsCurGroupBotOn {
+	if !bridgeOnly && group != nil && (group.Active || ctx.IsCurGroupBotOn) {
 		for _, wrapper := range group.GetActivatedExtList(ctx.Dice) {
 			ext := wrapper.GetRealExt()
 			if ext == nil {
@@ -2841,6 +2894,7 @@ func (ctx *MsgContext) ShallowCopy() *MsgContext {
 	}
 	copyCtx := &MsgContext{
 		MessageType:         ctx.MessageType,
+		LLMBridgeRequest:    ctx.LLMBridgeRequest,
 		Group:               ctx.Group,
 		Player:              ctx.Player,
 		IsCompatibilityTest: ctx.IsCompatibilityTest,

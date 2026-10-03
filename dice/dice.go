@@ -264,6 +264,10 @@ type Dice struct {
 
 	ContainerMode bool `json:"-" yaml:"-"` // 容器模式：禁用内置适配器，不允许使用内置Lagrange和旧的内置Gocq
 
+	onebotBridgeIsolated bool   `json:"-" yaml:"-"`
+	onebotBridgeBind     string `json:"-" yaml:"-"`
+	onebotBridgeToken    string `json:"-" yaml:"-"`
+
 	IsAlreadyLoadConfig bool `yaml:"-"` // 如果在loads前崩溃，那么不写入配置，防止覆盖为空的
 
 	// 用于检查是否需要插入到数据库的哈希表 150因为没有对应插入 到时候这个就没用了
@@ -345,8 +349,9 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	}
 
 	d.registerCoreCommands()
-	d.RegisterBuiltinExt()
+	d.registerBuiltinExtForRuntime()
 	d.loads()
+	d.applyOnebotBridgeIsolation()
 	if err := d.ActivateDiceRandomMode(); err != nil && d.Logger != nil {
 		d.Logger.Warnf("[随机源] 激活配置模式失败，已使用 PCG 回退: %v", err)
 	}
@@ -359,9 +364,10 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 		d.NewCensorManager()
 	}
 
-	go d.PublicDiceSetup()
-
-	go d.StoreSetup()
+	if !d.onebotBridgeIsolated {
+		go d.PublicDiceSetup()
+		go d.StoreSetup()
+	}
 
 	// 创建js运行时
 	if d.Config.JsEnable {
@@ -373,24 +379,30 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 	}
 
 	// 在 JS 初始化重建规则模板注册表后恢复扩展包及其模板。
-	d.PackageSetup()
+	if !d.onebotBridgeIsolated {
+		d.PackageSetup()
+	}
 
-	for _, i := range d.ExtList {
-		if i.OnLoad != nil {
-			i.callWithJsCheck(d, func() {
-				i.OnLoad()
-			})
+	if !d.onebotBridgeIsolated {
+		for _, i := range d.ExtList {
+			if i.OnLoad != nil {
+				i.callWithJsCheck(d, func() {
+					i.OnLoad()
+				})
+			}
 		}
 	}
 
-	for _, i := range d.RunAfterLoaded {
-		defer func() {
-			// 防止报错
-			if r := recover(); r != nil {
-				loggerInstance.Error("RunAfterLoaded 报错: ", r)
-			}
-		}()
-		i()
+	if !d.onebotBridgeIsolated {
+		for _, i := range d.RunAfterLoaded {
+			defer func() {
+				// 防止报错
+				if r := recover(); r != nil {
+					loggerInstance.Error("RunAfterLoaded 报错: ", r)
+				}
+			}()
+			i()
+		}
 	}
 	d.RunAfterLoaded = []func(){}
 
@@ -457,9 +469,13 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 			}
 		}
 	}
-	go refreshGroupInfo()
+	if !d.onebotBridgeIsolated {
+		go refreshGroupInfo()
+	}
 
-	d.ApplyAliveNotice()
+	if !d.onebotBridgeIsolated {
+		d.ApplyAliveNotice()
+	}
 	if d.Config.JsEnable {
 		d.JsBuiltinDigestSet = make(map[string]bool)
 		d.JsLoadScripts()
@@ -516,7 +532,9 @@ func (d *Dice) Init(operator engine.DatabaseOperator, uiWriter *logger.UIWriter)
 		}()
 	}
 
-	d.ResetQuitInactiveCron()
+	if !d.onebotBridgeIsolated {
+		d.ResetQuitInactiveCron()
+	}
 
 	d.MarkModified()
 }
@@ -575,7 +593,11 @@ func (d *Dice) _ExprTextBaseV1(buffer string, ctx *MsgContext, flags RollExtraFl
 	// 隐藏的内置字符串符号 \x1e
 	val, detail, err := d._ExprEvalBaseV1("\x1e"+buffer+"\x1e", ctx, flags)
 	if err != nil {
-		d.Logger.Warnf("脚本执行出错: %s -> %v", buffer, err)
+		if ctx != nil && ctx.LLMBridgeRequest != nil {
+			d.Logger.Warnf("OneBot LLM bridge expression failed: source_message_id=%d", ctx.LLMBridgeRequest.sourceMessage)
+		} else {
+			d.Logger.Warnf("脚本执行出错: %s -> %v", buffer, err)
+		}
 	}
 
 	if err == nil && (val.TypeID == VMTypeString || val.TypeID == VMTypeNone) {

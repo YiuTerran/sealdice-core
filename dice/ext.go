@@ -133,6 +133,16 @@ func (d *Dice) RegisterBuiltinExt() {
 	d.RegisterBuiltinSystemTemplate()
 }
 
+func (d *Dice) registerBuiltinExtForRuntime() {
+	if d.onebotBridgeIsolated {
+		RegisterBuiltinExtCoc7(d)
+		RegisterBuiltinExtDnd5e(d)
+		d.RegisterBuiltinSystemTemplate()
+		return
+	}
+	d.RegisterBuiltinExt()
+}
+
 func (d *Dice) RegisterBuiltinSystemTemplate() {
 	for _, asset := range []string{"coc7.yaml", "dnd5e.yaml"} {
 		tmpl, err := loadBuiltinTemplate(asset)

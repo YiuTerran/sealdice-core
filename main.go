@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -208,6 +209,22 @@ func main() {
 	err = godotenv.Load()
 	if err != nil {
 		log.Errorf("未读取到.env参数，若您未使用docker或第三方数据库，可安全忽略。")
+	}
+	bridgeEnabled, bridgeEnvErr := strconv.ParseBool(strings.TrimSpace(os.Getenv("SEALDICE_LLM_BRIDGE_ENABLED")))
+	if bridgeEnvErr != nil && strings.TrimSpace(os.Getenv("SEALDICE_LLM_BRIDGE_ENABLED")) != "" {
+		log.Error("SEALDICE_LLM_BRIDGE_ENABLED must be true or false")
+		return
+	}
+	bridgeBind := strings.TrimSpace(os.Getenv("SEALDICE_ONEBOT_BIND"))
+	if bridgeBind == "" {
+		bridgeBind = "0.0.0.0:18081"
+	}
+	bridgeToken := os.Getenv("ONEBOT_WS_TOKEN")
+	if bridgeEnabled {
+		if preflightErr := dice.PreflightOnebotLLMBridge(bridgeBind, bridgeToken); preflightErr != nil {
+			log.Errorf("OneBot LLM bridge startup refused: %s", preflightErr.Error())
+			return
+		}
 	}
 
 	switch opts.MutexProfileRate {
@@ -447,6 +464,12 @@ func main() {
 
 	// 初始化核心
 	diceManager.TryCreateDefault()
+	if bridgeEnabled {
+		if err := dice.ConfigureOnebotLLMBridge(diceManager, bridgeBind, bridgeToken); err != nil {
+			log.Errorf("OneBot LLM bridge startup refused: %s", err.Error())
+			return
+		}
+	}
 	diceManager.InitDice(uiWriter)
 
 	if opts.JustForTest {

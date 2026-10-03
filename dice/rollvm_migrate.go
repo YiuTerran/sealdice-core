@@ -387,7 +387,11 @@ func (ctx *MsgContext) EvalFString(expr string, flags *ds.RollConfig) *VMResultV
 	// 隐藏的内置字符串符号 \x1e
 	r := ctx.Eval("\x1e"+expr+"\x1e", flags)
 	if r.vm.Error != nil {
-		logger.M().Error("脚本执行出错: ", expr, "->", r.vm.Error)
+		if ctx.LLMBridgeRequest != nil {
+			logger.M().Warnf("OneBot LLM bridge expression failed: source_message_id=%d", ctx.LLMBridgeRequest.sourceMessage)
+		} else {
+			logger.M().Error("脚本执行出错: ", expr, "->", r.vm.Error)
+		}
 	}
 	return r
 }
@@ -497,31 +501,47 @@ func DiceExprEvalBase(ctx *MsgContext, s string, flags RollExtraFlags) (*VMResul
 			err = errors.New("脚本执行结果为空")
 		}
 		if ret == nil {
-			logger.M().Warnf(
-				"DiceExprEvalBase V2返回空结果: err=%v flags={V1Only:%v V2Only:%v DisableBlock:%v IgnoreDiv0:%v} expr=%q",
-				err, flags.V1Only, flags.V2Only, flags.DisableBlock, flags.IgnoreDiv0, exprLog,
-			)
+			if ctx.LLMBridgeRequest != nil {
+				logger.M().Warnf("OneBot LLM bridge expression failed: source_message_id=%d", ctx.LLMBridgeRequest.sourceMessage)
+			} else {
+				logger.M().Warnf(
+					"DiceExprEvalBase V2返回空结果: err=%v flags={V1Only:%v V2Only:%v DisableBlock:%v IgnoreDiv0:%v} expr=%q",
+					err, flags.V1Only, flags.V2Only, flags.DisableBlock, flags.IgnoreDiv0, exprLog,
+				)
+			}
 		}
 		if flags.V2Only {
 			return nil, "", err
 		}
-		logger.M().Error("脚本执行出错V2: ", exprLog, "->", err)
+		if ctx.LLMBridgeRequest != nil {
+			logger.M().Warnf("OneBot LLM bridge expression failed: source_message_id=%d", ctx.LLMBridgeRequest.sourceMessage)
+		} else {
+			logger.M().Error("脚本执行出错V2: ", exprLog, "->", err)
+		}
 		errV2 := err // 某种情况下没有这个值，很奇怪
 
 		// 尝试一下V1
 		val, detail, err := ctx.Dice._ExprEvalBaseV1(s, ctx, flags)
 		if err != nil {
-			logger.M().Warnf(
-				"DiceExprEvalBase 回退V1失败: errV2=%v errV1=%v flags={V1Only:%v V2Only:%v} expr=%q",
-				errV2, err, flags.V1Only, flags.V2Only, exprLog,
-			)
+			if ctx.LLMBridgeRequest != nil {
+				logger.M().Warnf("OneBot LLM bridge expression failed: source_message_id=%d", ctx.LLMBridgeRequest.sourceMessage)
+			} else {
+				logger.M().Warnf(
+					"DiceExprEvalBase 回退V1失败: errV2=%v errV1=%v flags={V1Only:%v V2Only:%v} expr=%q",
+					errV2, err, flags.V1Only, flags.V2Only, exprLog,
+				)
+			}
 			// 我们不关心 v1 的报错
 			return nil, detail, errV2
 		}
-		logger.M().Warnf(
-			"DiceExprEvalBase 回退V1成功: errV2=%v flags={V1Only:%v V2Only:%v} expr=%q",
-			errV2, flags.V1Only, flags.V2Only, exprLog,
-		)
+		if ctx.LLMBridgeRequest != nil {
+			logger.M().Warnf("OneBot LLM bridge expression recovered: source_message_id=%d", ctx.LLMBridgeRequest.sourceMessage)
+		} else {
+			logger.M().Warnf(
+				"DiceExprEvalBase 回退V1成功: errV2=%v flags={V1Only:%v V2Only:%v} expr=%q",
+				errV2, flags.V1Only, flags.V2Only, exprLog,
+			)
+		}
 
 		return &VMResultV2m{val.ConvertToV2(), ctx.vm, val, cocFlagVarPrefix, errV2}, detail, err
 	}

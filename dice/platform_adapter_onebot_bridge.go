@@ -1,0 +1,452 @@
+package dice
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"strconv"
+	"strings"
+	"sync"
+
+	socketio "github.com/PaienNate/pineutil/evsocket/v2"
+	"github.com/bytedance/sonic"
+	"github.com/google/uuid"
+
+	emitter "sealdice-core/dice/imsdk/onebot"
+	"sealdice-core/dice/imsdk/onebot/schema"
+	"sealdice-core/message"
+)
+
+const (
+	onebotLLMBridgeRegisterAction = "_llm_bridge_register"
+	onebotLLMBridgeCompleteAction = "_llm_bridge_complete"
+)
+
+type onebotBridgeConnection struct {
+	emitter      emitter.Emitter
+	ctx          context.Context
+	selfIDOnce   sync.Once
+	registerDone chan struct{}
+	registerOnce sync.Once
+
+	mu           sync.RWMutex
+	connectionID string
+	registered   bool
+	closed       bool
+}
+
+func (c *onebotBridgeConnection) registration() (string, bool) {
+	if c == nil {
+		return "", false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.connectionID, c.registered
+}
+
+func (c *onebotBridgeConnection) setRegistration(connectionID string, registered bool) {
+	c.mu.Lock()
+	if !c.closed {
+		c.connectionID = connectionID
+		c.registered = registered
+	} else {
+		c.connectionID = ""
+		c.registered = false
+	}
+	c.mu.Unlock()
+	c.registerOnce.Do(func() {
+		if c.registerDone != nil {
+			close(c.registerDone)
+		}
+	})
+}
+
+func (c *onebotBridgeConnection) close() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.closed = true
+	c.connectionID = ""
+	c.registered = false
+	c.mu.Unlock()
+	c.registerOnce.Do(func() {
+		if c.registerDone != nil {
+			close(c.registerDone)
+		}
+	})
+}
+
+func (c *onebotBridgeConnection) waitForRegistration() bool {
+	if c == nil {
+		return false
+	}
+	if c.registerDone != nil {
+		var ctxDone <-chan struct{}
+		if c.ctx != nil {
+			ctxDone = c.ctx.Done()
+		}
+		select {
+		case <-c.registerDone:
+		case <-ctxDone:
+			return false
+		}
+	}
+	_, registered := c.registration()
+	return registered
+}
+
+type onebotBridgeRegisterParams struct {
+	Version         int      `json:"version"`
+	BackendInstance string   `json:"backend_instance"`
+	Capabilities    []string `json:"capabilities"`
+}
+
+type onebotBridgeCompleteParams struct {
+	Version         int    `json:"version"`
+	SourceMessageID int64  `json:"source_message_id"`
+	ConnectionID    string `json:"connection_id"`
+	Status          string `json:"status"`
+	OutputCount     int    `json:"output_count"`
+}
+
+type onebotBridgeRegisterResult struct {
+	Version      int    `json:"version"`
+	ConnectionID string `json:"connection_id"`
+}
+
+type onebotActionResponse struct {
+	Status  string          `json:"status"`
+	RetCode int             `json:"retcode"`
+	Data    json.RawMessage `json:"data"`
+}
+
+// onebotBridgeRequestTracker is created for one registered socket and one
+// synthetic OneBot message. Its connection and recipient identities never
+// change, including when the adapter reconnects while the request is running.
+type onebotBridgeRequestTracker struct {
+	adapter       *PlatformAdapterOnebot
+	connection    *onebotBridgeConnection
+	connectionID  string
+	sourceMessage int64
+	audience      string
+	userID        int64
+	groupID       int64
+
+	mu              sync.Mutex
+	tasks           int
+	commandSolved   bool
+	failed          bool
+	outputCount     int
+	completionFired bool
+}
+
+func newOnebotBridgeRequestTracker(p *PlatformAdapterOnebot, conn *onebotBridgeConnection, msg *Message) (*onebotBridgeRequestTracker, error) {
+	if p == nil || conn == nil || msg == nil {
+		return nil, errors.New("bridge request is missing its adapter, connection, or message")
+	}
+	connectionID, registered := conn.registration()
+	if !registered || connectionID == "" {
+		return nil, errors.New("bridge connection has not registered")
+	}
+	sourceMessageID, ok := onebotPositiveInt32(msg.RawID)
+	if !ok {
+		return nil, errors.New("bridge source message id is invalid")
+	}
+	userID := ExtractQQEmitterUserID(msg.Sender.UserID)
+	tracker := &onebotBridgeRequestTracker{
+		adapter:       p,
+		connection:    conn,
+		connectionID:  connectionID,
+		sourceMessage: sourceMessageID,
+		audience:      msg.MessageType,
+		userID:        userID,
+		tasks:         1,
+	}
+	if userID <= 0 {
+		tracker.markFailed()
+		return tracker, errors.New("bridge sender id is invalid")
+	}
+	tracker.userID = userID
+	switch msg.MessageType {
+	case "group":
+		tracker.groupID = ExtractQQEmitterGroupID(msg.GroupID)
+		if tracker.groupID <= 0 {
+			tracker.markFailed()
+			return tracker, errors.New("bridge group id is invalid")
+		}
+	case "private":
+	default:
+		tracker.markFailed()
+		return tracker, errors.New("bridge message type is unsupported")
+	}
+	return tracker, nil
+}
+
+func onebotPositiveInt32(value any) (int64, bool) {
+	var parsed int64
+	switch v := value.(type) {
+	case int:
+		parsed = int64(v)
+	case int32:
+		parsed = int64(v)
+	case int64:
+		parsed = v
+	case uint:
+		if uint64(v) > math.MaxInt32 {
+			return 0, false
+		}
+		parsed = int64(v)
+	case uint32:
+		parsed = int64(v)
+	case uint64:
+		if v > math.MaxInt32 {
+			return 0, false
+		}
+		parsed = int64(v)
+	case json.Number:
+		vInt, err := v.Int64()
+		if err != nil {
+			return 0, false
+		}
+		parsed = vInt
+	case string:
+		vInt, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		parsed = vInt
+	default:
+		return 0, false
+	}
+	return parsed, parsed > 0 && parsed <= math.MaxInt32
+}
+
+func (r *onebotBridgeRequestTracker) beginTask() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	if r.completionFired {
+		r.mu.Unlock()
+		return false
+	}
+	r.tasks++
+	r.mu.Unlock()
+	return true
+}
+
+func (r *onebotBridgeRequestTracker) finishTask() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.tasks > 0 {
+		r.tasks--
+	}
+	shouldComplete := r.tasks == 0 && !r.completionFired
+	if shouldComplete {
+		r.completionFired = true
+	}
+	status := "failed"
+	if !r.failed && r.commandSolved {
+		status = "ok"
+	}
+	params := onebotBridgeCompleteParams{
+		Version:         1,
+		SourceMessageID: r.sourceMessage,
+		ConnectionID:    r.connectionID,
+		Status:          status,
+		OutputCount:     r.outputCount,
+	}
+	r.mu.Unlock()
+
+	if shouldComplete {
+		r.emitCompletion(params)
+	}
+}
+
+func (r *onebotBridgeRequestTracker) markFailed() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.failed = true
+	r.mu.Unlock()
+}
+
+func (r *onebotBridgeRequestTracker) markCommandResult(solved bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if solved {
+		r.commandSolved = true
+	} else {
+		r.failed = true
+	}
+	r.mu.Unlock()
+}
+
+func (r *onebotBridgeRequestTracker) recordSend(success bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if success {
+		r.outputCount++
+	} else {
+		r.failed = true
+	}
+	r.mu.Unlock()
+}
+
+func (r *onebotBridgeRequestTracker) emitCompletion(params onebotBridgeCompleteParams) {
+	if r == nil || r.connection == nil || r.connection.emitter == nil {
+		return
+	}
+	ctx := r.connection.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, err := r.connection.emitter.Raw(ctx, onebotLLMBridgeCompleteAction, params); err != nil {
+		// The emitter includes action parameters in its error string. These fields
+		// contain only protocol IDs and state, so logging the action without err is
+		// still bounded and cannot expose private message text.
+		if r.adapter.logger != nil {
+			r.adapter.logger.Warnf("OneBot LLM bridge completion action failed: source_message_id=%d", r.sourceMessage)
+		}
+	}
+}
+
+func (p *PlatformAdapterOnebot) bridgeConnection(kws *socketio.WebsocketWrapper) *onebotBridgeConnection {
+	if p == nil || kws == nil {
+		return nil
+	}
+	p.bridgeConnectionMu.RLock()
+	conn := p.bridgeConnections[kws]
+	p.bridgeConnectionMu.RUnlock()
+	return conn
+}
+
+func (p *PlatformAdapterOnebot) registerLLMBridgeConnection(conn *onebotBridgeConnection) error {
+	if p == nil || conn == nil || conn.emitter == nil {
+		return errors.New("bridge emitter unavailable")
+	}
+	p.bridgeInstanceOnce.Do(func() {
+		p.bridgeInstanceID = uuid.NewString()
+	})
+	params := onebotBridgeRegisterParams{
+		Version:         1,
+		BackendInstance: p.bridgeInstanceID,
+		Capabilities:    []string{"reply", "complete"},
+	}
+	ctx := conn.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	data, err := conn.emitter.Raw(ctx, onebotLLMBridgeRegisterAction, params)
+	if err != nil {
+		return fmt.Errorf("register bridge action failed: %w", err)
+	}
+	var response onebotActionResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		return errors.New("register bridge action returned malformed response")
+	}
+	if strings.EqualFold(response.Status, "failed") || response.RetCode != 0 {
+		return fmt.Errorf("register bridge action rejected: status=%s retcode=%d", response.Status, response.RetCode)
+	}
+	var result onebotBridgeRegisterResult
+	if err := json.Unmarshal(response.Data, &result); err != nil {
+		return errors.New("register bridge action returned malformed data")
+	}
+	if result.Version != 1 || strings.TrimSpace(result.ConnectionID) == "" {
+		return errors.New("register bridge action returned invalid connection identity")
+	}
+	conn.setRegistration(result.ConnectionID, true)
+	if _, registered := conn.registration(); !registered {
+		return errors.New("bridge connection closed during registration")
+	}
+	return nil
+}
+
+func (p *PlatformAdapterOnebot) sendBridgeText(ctx *MsgContext, groupID, userID string, segments []message.IMessageElement) {
+	tracker := (*onebotBridgeRequestTracker)(nil)
+	if ctx != nil {
+		tracker = ctx.LLMBridgeRequest
+	}
+	if tracker == nil || tracker.connection == nil || tracker.connection.emitter == nil {
+		if p != nil && p.logger != nil {
+			p.logger.Warn("OneBot LLM bridge output rejected: missing request context")
+		}
+		return
+	}
+	if len(segments) == 0 {
+		return
+	}
+	var targetID int64
+	isGroup := groupID != ""
+	if isGroup {
+		targetID = ExtractQQEmitterGroupID(groupID)
+		if tracker.audience != "group" || targetID <= 0 || targetID != tracker.groupID {
+			tracker.recordSend(false)
+			if p.logger != nil {
+				p.logger.Warnf("OneBot LLM bridge output rejected: source_message_id=%d audience=group", tracker.sourceMessage)
+			}
+			return
+		}
+	} else {
+		targetID = ExtractQQEmitterUserID(userID)
+		if targetID <= 0 || targetID != tracker.userID {
+			tracker.recordSend(false)
+			if p.logger != nil {
+				p.logger.Warnf("OneBot LLM bridge output rejected: source_message_id=%d audience=private", tracker.sourceMessage)
+			}
+			return
+		}
+	}
+	for _, segment := range segments {
+		if segment == nil || segment.Type() != message.Text {
+			tracker.recordSend(false)
+			if p.logger != nil {
+				p.logger.Warnf("OneBot LLM bridge output rejected: source_message_id=%d unsupported_segment", tracker.sourceMessage)
+			}
+			return
+		}
+	}
+	tracker.mu.Lock()
+	canSend := !tracker.completionFired && tracker.tasks > 0
+	tracker.mu.Unlock()
+	if !canSend {
+		tracker.recordSend(false)
+		return
+	}
+	chain, _ := convertSealMsgToMessageChain(segments)
+	replyData, err := json.Marshal(schema.Reply{Id: int(tracker.sourceMessage)})
+	if err != nil {
+		tracker.recordSend(false)
+		return
+	}
+	chain = append(schema.MessageChain{{Type: "reply", Data: sonic.NoCopyRawMessage(replyData)}}, chain...)
+	ctxForSend := tracker.connection.ctx
+	if ctxForSend == nil {
+		ctxForSend = context.Background()
+	}
+	if isGroup {
+		_, err = tracker.connection.emitter.SendGrMsg(ctxForSend, targetID, chain)
+	} else {
+		_, err = tracker.connection.emitter.SendPvtMsg(ctxForSend, targetID, chain)
+	}
+	tracker.recordSend(err == nil)
+	if err != nil && p.logger != nil {
+		if isGroup {
+			p.logger.Warnf("OneBot LLM bridge group send failed: source_message_id=%d", tracker.sourceMessage)
+		} else {
+			// SendPvtMsg errors include the serialized action parameters, including
+			// private message text. Never log or wrap that value on this path.
+			p.logger.Warnf("OneBot LLM bridge private send failed: source_message_id=%d", tracker.sourceMessage)
+		}
+	}
+}

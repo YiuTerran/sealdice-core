@@ -381,6 +381,10 @@ func ReplyToSender(ctx *MsgContext, msg *Message, text string) {
 		logger.M().Errorf("ReplyToSender 被调用，但没有正确传递参数！请检查您的参数！: ctx=%v, msg=%v", ctx, msg)
 		return
 	}
+	if ctx.LLMBridgeRequest != nil {
+		ReplyToSenderRaw(ctx, msg, text, "")
+		return
+	}
 	panicHandler.Once(logger.M(), func() {
 		ReplyToSenderRaw(ctx, msg, text, "")
 	})
@@ -389,6 +393,10 @@ func ReplyToSender(ctx *MsgContext, msg *Message, text string) {
 func ReplyToSenderNoCheck(ctx *MsgContext, msg *Message, text string) {
 	if ctx == nil || msg == nil || ctx.Dice == nil {
 		logger.M().Errorf("ReplyToSenderNoCheck 被调用，但没有正确传递参数！请检查您的参数！: ctx=%v, msg=%v", ctx, msg)
+		return
+	}
+	if ctx.LLMBridgeRequest != nil {
+		replyToSenderRawNoCheck(ctx, msg, text, "")
 		return
 	}
 	panicHandler.Once(logger.M(), func() {
@@ -414,9 +422,11 @@ func ReplyGroupRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 
 	d := ctx.Dice
 	if d != nil {
-		d.Logger.Infof("发给(群%s): %s", msg.GroupID, text)
+		if ctx.LLMBridgeRequest == nil {
+			d.Logger.Infof("发给(群%s): %s", msg.GroupID, text)
+		}
 		// 敏感词拦截：回复（群）
-		if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
+		if ctx.LLMBridgeRequest == nil && d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
 			// 先拿掉海豹码和CQ码再检查敏感词
 			checkText := sealCodeRe.ReplaceAllString(text, "")
 			checkText = cqCodeRe.ReplaceAllString(checkText, "")
@@ -486,9 +496,11 @@ func ReplyPersonRaw(ctx *MsgContext, msg *Message, text string, flag string) {
 
 	d := ctx.Dice
 	if d != nil {
-		d.Logger.Infof("发给(帐号%s): %s", msg.Sender.UserID, text)
+		if ctx.LLMBridgeRequest == nil {
+			d.Logger.Infof("发给(帐号%s): %s", msg.Sender.UserID, text)
+		}
 		// 敏感词拦截：回复（个人）
-		if d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
+		if ctx.LLMBridgeRequest == nil && d.Config.EnableCensor && d.Config.CensorMode == OnlyOutputReply {
 			// 先拿掉海豹码和CQ码再检查敏感词
 			checkText := sealCodeRe.ReplaceAllString(text, "")
 			checkText = cqCodeRe.ReplaceAllString(checkText, "")

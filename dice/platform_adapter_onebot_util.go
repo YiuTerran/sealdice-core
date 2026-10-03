@@ -37,18 +37,37 @@ const (
 
 // serveOnebotEvent 消息分发函数。该函数将所有的传入参数，全部转换为array模式
 func (p *PlatformAdapterOnebot) serveOnebotEvent(ep *evsocket.EventPayload) {
-	p.logger.Debugf("Message event - User: %s - Message: %s", ep.Kws.GetStringAttribute("user_id"), string(ep.Data))
+	if p.LLMBridgeEnabled {
+		p.logger.Debug("OneBot LLM bridge event received")
+	} else {
+		p.logger.Debugf("Message event - User: %s - Message: %s", ep.Kws.GetStringAttribute("user_id"), string(ep.Data))
+	}
 	if !gjson.ValidBytes(ep.Data) {
 		return
 	}
 	// 注册Emitter
 	resp := gjson.ParseBytes(ep.Data)
+	if p.LLMBridgeEnabled {
+		postType := resp.Get("post_type").String()
+		if postType != "" && postType != "message" {
+			p.logger.Warn("OneBot LLM bridge event rejected: only message events are accepted")
+			return
+		}
+	}
 	if resp.Get("self_id").Int() != 0 {
-		p.once.Do(func() {
-			if p.sendEmitter != nil {
-				_ = p.sendEmitter.SetSelfId(p.ctx, resp.Get("self_id").Int())
+		if p.LLMBridgeEnabled {
+			if conn := p.bridgeConnection(ep.Kws); conn != nil && conn.emitter != nil {
+				conn.selfIDOnce.Do(func() {
+					_ = conn.emitter.SetSelfId(conn.ctx, resp.Get("self_id").Int())
+				})
 			}
-		})
+		} else {
+			p.once.Do(func() {
+				if p.sendEmitter != nil {
+					_ = p.sendEmitter.SetSelfId(p.ctx, resp.Get("self_id").Int())
+				}
+			})
+		}
 	}
 	// 解析是string还是array
 	// TODO: 不知道是不是通过这种方式判断是string或者array的
@@ -63,7 +82,11 @@ func (p *PlatformAdapterOnebot) serveOnebotEvent(ep *evsocket.EventPayload) {
 	if p.wsmode == "string" {
 		resp2, err := string2array(resp)
 		if err != nil {
-			p.logger.Warnf("消息转换为array异常 %s 未能正确处理", resp.String())
+			if p.LLMBridgeEnabled {
+				p.logger.Warn("OneBot LLM bridge message rejected: malformed message encoding")
+			} else {
+				p.logger.Warnf("消息转换为array异常 %s 未能正确处理", resp.String())
+			}
 			return
 		}
 		resp = resp2
@@ -81,10 +104,84 @@ func (p *PlatformAdapterOnebot) serveOnebotEvent(ep *evsocket.EventPayload) {
 }
 
 func (p *PlatformAdapterOnebot) onOnebotMessageEvent(ep *evsocket.EventPayload) {
-	// 收到普通消息的时候：执行ExecuteNew函数
-	msg, err := arrayByte2SealdiceMessage(p.logger, ep.Data)
+	if p.LLMBridgeEnabled {
+		conn := p.bridgeConnection(ep.Kws)
+		if conn == nil {
+			p.logger.Warn("OneBot LLM bridge message rejected: connection is not registered")
+			return
+		}
+		// Registration's action echo may still be in flight. Process the event on
+		// a separate goroutine so waiting here cannot block the socket reader that
+		// must deliver that echo.
+		data := append([]byte(nil), ep.Data...)
+		go p.processOnebotMessageEvent(data, conn)
+		return
+	}
+	p.processOnebotMessageEvent(ep.Data, nil)
+}
+
+func (p *PlatformAdapterOnebot) processOnebotMessageEvent(raw []byte, conn *onebotBridgeConnection) {
+	if conn != nil && !conn.waitForRegistration() {
+		p.logger.Warn("OneBot LLM bridge message rejected: connection registration failed")
+		return
+	}
+	if p.LLMBridgeEnabled && !gjson.ValidBytes(raw) {
+		p.completeMalformedBridgeMessage(conn, raw)
+		p.logger.Warn("OneBot LLM bridge message rejected: malformed event")
+		return
+	}
+	parseLogger := p.logger
+	if p.LLMBridgeEnabled {
+		// The legacy parser has a few diagnostics that include the raw event.
+		// Bridge payloads can contain private identities and hidden command text.
+		parseLogger = zap.NewNop().Sugar()
+	}
+	msg, err := arrayByte2SealdiceMessage(parseLogger, raw)
 	if err != nil {
+		if p.LLMBridgeEnabled {
+			p.completeMalformedBridgeMessage(conn, raw)
+			p.logger.Warn("OneBot LLM bridge message rejected: malformed event")
+			return
+		}
 		p.logger.Errorf("收到消息但无法进行处理，原因为 %s", err)
+		return
+	}
+	if conn != nil {
+		tracker, trackerErr := newOnebotBridgeRequestTracker(p, conn, msg)
+		if tracker == nil {
+			p.logger.Warnf("OneBot LLM bridge message rejected: invalid source_message_id")
+			return
+		}
+		if trackerErr != nil {
+			tracker.markFailed()
+			tracker.finishTask()
+			p.logger.Warnf("OneBot LLM bridge message rejected: %s", trackerErr.Error())
+			return
+		}
+		for _, segment := range msg.Segment {
+			if segment.Type() != message.Text {
+				tracker.markFailed()
+				tracker.finishTask()
+				p.logger.Warn("OneBot LLM bridge message rejected: only text input is supported")
+				return
+			}
+		}
+		msg.LLMBridgeRequest = tracker
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					tracker.markFailed()
+					p.logger.Warnf("OneBot LLM bridge execution failed: source_message_id=%d", tracker.sourceMessage)
+				}
+				tracker.finishTask()
+			}()
+			session := p.EndPoint.Session
+			if session == nil {
+				tracker.markFailed()
+				return
+			}
+			session.ExecuteNew(p.EndPoint, msg)
+		}()
 		return
 	}
 	session := p.EndPoint.Session
@@ -94,6 +191,29 @@ func (p *PlatformAdapterOnebot) onOnebotMessageEvent(ep *evsocket.EventPayload) 
 	}
 
 	session.ExecuteNew(p.EndPoint, msg)
+}
+
+func (p *PlatformAdapterOnebot) completeMalformedBridgeMessage(conn *onebotBridgeConnection, raw []byte) {
+	if conn == nil {
+		return
+	}
+	connectionID, registered := conn.registration()
+	if !registered || connectionID == "" {
+		return
+	}
+	messageID, ok := onebotPositiveInt32(gjson.ParseBytes(raw).Get("message_id").Int())
+	if !ok {
+		return
+	}
+	tracker := &onebotBridgeRequestTracker{
+		adapter:       p,
+		connection:    conn,
+		connectionID:  connectionID,
+		sourceMessage: messageID,
+		tasks:         1,
+		failed:        true,
+	}
+	tracker.finishTask()
 }
 
 func (p *PlatformAdapterOnebot) onOnebotRequestEvent(ep *evsocket.EventPayload) {

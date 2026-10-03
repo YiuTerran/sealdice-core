@@ -187,7 +187,9 @@ func ReplyReload(dice *Dice) {
 }
 
 func RegisterBuiltinExtReply(dice *Dice) {
-	ReplyReload(dice)
+	if !dice.onebotBridgeIsolated {
+		ReplyReload(dice)
+	}
 
 	theExt := &ExtInfo{
 		Name:       "reply", // 扩展的名称，需要用于开启和关闭指令中，写简短点
