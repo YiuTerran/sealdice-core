@@ -48,7 +48,7 @@ func showMsgBox(title string, message string) {
 }
 
 func executeWin(name string, arg ...string) *exec.Cmd {
-	cmd := exec.Command(name, arg...)
+	cmd := exec.Command(name, arg...) //nolint:gosec // The resolved executable and separate argv are passed without a shell.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 		Pgid:    os.Getppid(),
@@ -84,7 +84,7 @@ func onReady() {
 		case <-mOpen.ClickedCh:
 			_ = exec.Command(`open`, `http://localhost:`+getTrayPort()).Start()
 		case <-mOpenExeDir.ClickedCh:
-			_ = exec.Command(`open`, filepath.Dir(os.Args[0])).Start()
+			_ = exec.Command(`open`, filepath.Dir(os.Args[0])).Start() //nolint:gosec // The fixed open binary receives a separate directory argument.
 		case <-mQuit.ClickedCh:
 			systrayQuited = true
 			cleanupCreate(theDm)()

@@ -1,0 +1,219 @@
+name: Native bridge image validation and publish
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sealdice-container-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  test-and-lint:
+    name: Test & Lint
+    uses: ./.github/workflows/test-and-lint.yml
+
+  native-smoke:
+    name: Native ${{ matrix.arch }} bridge build and startup
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source and pinned resources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: go.sum
+
+      - name: Run focused native bridge tests
+        run: go test ./dice -run 'TestOnebotBridge|TestValidateOnebotBridgeData' -count=1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image on native architecture
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          pull: true
+          load: true
+          push: false
+          platforms: linux/${{ matrix.arch }}
+          tags: qqbot-sealdice:ci-${{ matrix.arch }}
+          cache-from: type=gha,scope=smoke-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=smoke-${{ matrix.arch }}
+
+      - name: Start headless bridge and verify native listener
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name sealdice-bridge-smoke \
+            -p 127.0.0.1:18081:18081 \
+            -e SEALDICE_LLM_BRIDGE_ENABLED=true \
+            -e SEALDICE_ONEBOT_BIND=0.0.0.0:18081 \
+            -e ONEBOT_WS_TOKEN=ci-smoke-token-not-a-secret \
+            qqbot-sealdice:ci-${{ matrix.arch }}
+          python3 - <<'PY'
+          import socket
+          import subprocess
+          import time
+
+          deadline = time.monotonic() + 40
+          while time.monotonic() < deadline:
+              running = subprocess.check_output(
+                  ["docker", "inspect", "--format", "{{.State.Running}}", "sealdice-bridge-smoke"],
+                  text=True,
+              ).strip()
+              if running != "true":
+                  raise SystemExit("SeaDice container exited before its listener became ready")
+              try:
+                  with socket.create_connection(("127.0.0.1", 18081), timeout=1):
+                      print("SeaDice headless OneBot WebSocket listener accepted a TCP connection")
+                      break
+              except OSError:
+                  time.sleep(0.25)
+          else:
+              raise SystemExit("SeaDice OneBot WebSocket listener did not become ready")
+          PY
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+
+      - name: Collect startup logs on failure
+        if: failure()
+        run: docker logs --tail=100 sealdice-bridge-smoke
+
+      - name: Remove smoke container
+        if: always()
+        run: docker rm -f sealdice-bridge-smoke || true
+
+  release-build:
+    name: Push validated ${{ matrix.arch }} digest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - test-and-lint
+      - native-smoke
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    environment: deploy
+    steps:
+      - name: Check out release source and pinned resources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_SECRET }}
+
+      - name: Build and push validated architecture image by digest
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          pull: true
+          push: true
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=tryao/sealdice-core,push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
+
+      - name: Save pushed digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload architecture digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    name: Publish versioned amd64/arm64 manifest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - test-and-lint
+      - native-smoke
+      - release-build
+    runs-on: ubuntu-24.04
+    environment: deploy
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_SECRET }}
+
+      - name: Download architecture digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Create and verify the fixed version manifest
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mapfile -t DIGESTS < <(find /tmp/digests -maxdepth 1 -type f -printf '%f\n' | sort)
+          [[ "${#DIGESTS[@]}" -eq 2 ]]
+          for digest in "${DIGESTS[@]}"; do
+            [[ "$digest" =~ ^[a-f0-9]{64}$ ]]
+          done
+
+          docker buildx imagetools create \
+            --tag "tryao/sealdice-core:$IMAGE_TAG" \
+            "tryao/sealdice-core@sha256:${DIGESTS[0]}" \
+            "tryao/sealdice-core@sha256:${DIGESTS[1]}"
+
+          docker buildx imagetools inspect --raw "tryao/sealdice-core:$IMAGE_TAG" > /tmp/manifest.json
+          jq -e '
+            [.manifests[] | select(.platform.architecture != "unknown") | "\(.platform.os)/\(.platform.architecture)"]
+            | sort == ["linux/amd64", "linux/arm64"]
+          ' /tmp/manifest.json

@@ -141,7 +141,7 @@ func TestGlobalRandSourceReportGetText(t *testing.T) {
 	))
 
 	got := globalRandSource.ReportGetText(20)
-	for mode, raw := range map[DiceRandomMode]uint64{
+	for mode, raw := range map[DiceRandomMode]uint64{ //nolint:exhaustive // This assertion checks only the modes rendered in the report.
 		DiceRandomModePCG:  0,
 		DiceRandomModeNIST: 2,
 		DiceRandomModeCRNG: 3,

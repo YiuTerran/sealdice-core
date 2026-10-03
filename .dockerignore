@@ -1,0 +1,13 @@
+.git
+.github
+.idea
+.vscode
+**/node_modules
+**/dist
+**/.env*
+**/*private*.pem
+data
+backups
+cache
+frontend_overwrite
+static/frontend
