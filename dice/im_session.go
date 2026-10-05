@@ -869,15 +869,16 @@ type MsgContext struct {
 	Dice            *Dice         // 对应的 Dice
 	IsCurGroupBotOn bool          `jsbind:"isCurGroupBotOn"` // 在群内是否bot on
 
-	IsPrivate        bool                        `jsbind:"isPrivate"` // 是否私聊
-	LLMBridgeRequest *onebotBridgeRequestTracker `json:"-"`
-	CommandID        int64                       // 指令ID
-	CommandHideFlag  string                      `jsbind:"commandHideFlag"` // 暗骰来源群号
-	CommandInfo      interface{}                 // 命令信息
-	PrivilegeLevel   int                         `jsbind:"privilegeLevel"` // 权限等级 -30ban 40邀请者 50管理 60群主 70信任 100master
-	GroupRoleLevel   int                         // 群内权限 40邀请者 50管理 60群主 70信任 100master，相当于不考虑ban的权限等级
-	DelegateText     string                      `jsbind:"delegateText"`  // 代骰附加文本
-	AliasPrefixText  string                      `json:"aliasPrefixText"` // 快捷指令回复前缀文本
+	IsPrivate         bool                        `jsbind:"isPrivate"` // 是否私聊
+	LLMBridgeRequest  *onebotBridgeRequestTracker `json:"-"`
+	LLMBridgeReadOnly bool                        `json:"-"`
+	CommandID         int64                       // 指令ID
+	CommandHideFlag   string                      `jsbind:"commandHideFlag"` // 暗骰来源群号
+	CommandInfo       interface{}                 // 命令信息
+	PrivilegeLevel    int                         `jsbind:"privilegeLevel"` // 权限等级 -30ban 40邀请者 50管理 60群主 70信任 100master
+	GroupRoleLevel    int                         // 群内权限 40邀请者 50管理 60群主 70信任 100master，相当于不考虑ban的权限等级
+	DelegateText      string                      `jsbind:"delegateText"`  // 代骰附加文本
+	AliasPrefixText   string                      `json:"aliasPrefixText"` // 快捷指令回复前缀文本
 
 	deckDepth           int                                         // 抽牌递归深度
 	DeckPools           map[*DeckInfo]map[string]*ShuffleRandomPool // 不放回抽取的缓存
@@ -1727,15 +1728,16 @@ func (ep *EndPointInfo) TriggerCommand(mctx *MsgContext, msg *Message, cmdArgs *
 }
 
 func (ep *EndPointInfo) TriggerCommandBridge(mctx *MsgContext, msg *Message, cmdArgs *CmdArgs) bool {
+	readOnly := onebotBridgeIsReadOnlyCommand(strings.ToLower(cmdArgs.Command), cmdArgs)
 	solved := mctx.Session.commandSolveRestricted(mctx, msg, cmdArgs, true)
 	if solved {
 		ep.CmdExecutedNum++
 		ep.CmdExecutedLastTime = time.Now().Unix()
-		if mctx.Player != nil {
+		if mctx.Player != nil && !readOnly {
 			mctx.Player.LastCommandTime = ep.CmdExecutedLastTime
 			mctx.Player.UpdatedAtTime = time.Now().Unix()
 		}
-		if mctx.Group != nil {
+		if mctx.Group != nil && !readOnly {
 			mctx.Group.MarkDirty(mctx.Dice)
 		}
 	}
@@ -2239,6 +2241,22 @@ func (s *IMSession) commandSolve(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs
 }
 
 func (s *IMSession) commandSolveRestricted(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs, bridgeOnly bool) bool {
+	if bridgeOnly {
+		command := strings.ToLower(cmdArgs.Command)
+		if !onebotBridgeCommandAllowed(ctx, command, cmdArgs) {
+			if ctx != nil && ctx.LLMBridgeRequest != nil {
+				ctx.LLMBridgeRequest.markFailedAt("command_not_allowed_at_solve")
+			}
+			return false
+		}
+		ctx.LLMBridgeReadOnly = onebotBridgeIsReadOnlyCommand(command, cmdArgs)
+		if (command == "master" || command == "ban") && !isOnebotBridgeMasterCommand(ctx, msg, cmdArgs) {
+			if ctx.LLMBridgeRequest != nil {
+				ctx.LLMBridgeRequest.markFailedAt("master_acl_denied_at_solve")
+			}
+			return false
+		}
+	}
 	// 设置临时变量
 	if ctx.Player != nil {
 		SetTempVars(ctx, msg.Sender.Nickname)
@@ -2257,8 +2275,7 @@ func (s *IMSession) commandSolveRestricted(ctx *MsgContext, msg *Message, cmdArg
 			if ext != nil {
 				name := strings.ToLower(ext.Name)
 				command := strings.ToLower(cmdArgs.Command)
-				if ext.IsJsExt || (name != "coc7" && name != "dnd5e") ||
-					(command != "ra" && command != "rc" && command != "st" && command != "sc" && command != "en") {
+				if ext.IsJsExt || !onebotBridgeExtensionCommandAllowed(name, command) {
 					return false
 				}
 			}
@@ -2423,6 +2440,27 @@ func (s *IMSession) commandSolveRestricted(ctx *MsgContext, msg *Message, cmdArg
 	}
 
 	return solved
+}
+
+func onebotBridgeExtensionCommandAllowed(extension, command string) bool {
+	switch extension {
+	case "coc7":
+		switch command {
+		case "ra", "rc", "st", "sc", "en", "setcoc", "ti", "li", "coc":
+			return true
+		}
+	case "dnd5e":
+		switch command {
+		case "ra", "rc", "st", "dnd", "dndx", "buff", "ss", "ds", "死亡豁免", "init":
+			return true
+		}
+	case "fun":
+		switch command {
+		case "ping", "gugu", "咕咕", "jrrp", "rsr", "ek", "dx", "ww":
+			return true
+		}
+	}
+	return false
 }
 
 func (s *IMSession) OnMessageDeleted(mctx *MsgContext, msg *Message) {

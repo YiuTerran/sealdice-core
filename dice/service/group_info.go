@@ -145,3 +145,19 @@ func GroupPlayerInfoSave(operator engine2.DatabaseOperator, info *model.GroupPla
 	// 返回 nil 表示操作成功
 	return nil
 }
+
+// GroupPlayerIdentityRegister records that a private sender was observed by
+// the backend without creating or activating the sender's PG-* group. This
+// metadata lets bridge management commands distinguish a previously seen
+// virtual user from a guessed numeric target.
+func GroupPlayerIdentityRegister(operator engine2.DatabaseOperator, groupID, userID, name string) error {
+	if operator == nil || groupID == "" || userID == "" {
+		return nil
+	}
+	db := operator.GetDataDB(constant.WRITE)
+	info := model.GroupPlayerInfoBase{GroupID: groupID, UserID: userID, Name: name}
+	return db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "group_id"}, {Name: "user_id"}},
+		DoNothing: true,
+	}).Create(&info).Error
+}

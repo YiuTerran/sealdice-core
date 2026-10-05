@@ -9,6 +9,8 @@ FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS go-build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . ./
 RUN rm -rf static/frontend && mkdir -p static/frontend
 COPY --from=ui-build /src/sealdice-ui/dist/ /src/static/frontend/

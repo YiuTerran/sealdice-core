@@ -40,6 +40,24 @@ func (am *AttrsManager) LoadByCtx(ctx *MsgContext) (*AttributesItem, error) {
 	return am.Load(ctx.Group.GroupID, ctx.Player.UserID)
 }
 
+// LoadByCtxReadOnly reads the active character sheet without caching or
+// creating a missing empty sheet. Bridge query commands use this to avoid
+// turning a read into a later empty-row database upsert.
+func (am *AttrsManager) LoadByCtxReadOnly(ctx *MsgContext) (*AttributesItem, error) {
+	if ctx.IsCompatibilityTest {
+		return am.LoadByIdReadOnly(fmt.Sprintf("%s-%s", ctx.Group.GroupID, ctx.Player.UserID))
+	}
+	userID := am.UIDConvert(ctx.Player.UserID)
+	bindingID, err := service.AttrsGetBindingSheetIdByGroupId(am.db, fmt.Sprintf("%s-%s", ctx.Group.GroupID, userID))
+	if err != nil {
+		return nil, err
+	}
+	if bindingID == "" {
+		bindingID = fmt.Sprintf("%s-%s", ctx.Group.GroupID, userID)
+	}
+	return am.LoadByIdReadOnly(bindingID)
+}
+
 func (am *AttrsManager) Load(groupId string, userId string) (*AttributesItem, error) {
 	userId = am.UIDConvert(userId)
 
@@ -169,6 +187,41 @@ func (am *AttrsManager) LoadById(id string) (*AttributesItem, error) {
 	}
 	am.m.Store(id, i)
 	return i, nil
+}
+
+// LoadByIdReadOnly returns cached data when available, otherwise reads the
+// database into a transient object. A missing record stays absent and is never
+// queued for persistence.
+func (am *AttrsManager) LoadByIdReadOnly(id string) (*AttributesItem, error) {
+	if item, exists := am.m.Load(id); exists && item != nil {
+		return item, nil
+	}
+	data, err := service.AttrsGetById(am.db, id)
+	if err != nil {
+		return nil, err
+	}
+	if !data.IsDataExists() {
+		return &AttributesItem{ID: id, valueMap: &ds.ValueMap{}, IsSaved: true}, nil
+	}
+	value, err := ds.VMValueFromJSON(data.Data)
+	if err != nil {
+		return nil, err
+	}
+	values, ok := value.ReadDictData()
+	if !ok {
+		return nil, errors.New("角色数据类型不正确")
+	}
+	if values.Dict == nil {
+		values.Dict = &ds.ValueMap{}
+	}
+	return &AttributesItem{
+		ID:           id,
+		valueMap:     values.Dict,
+		Name:         data.Name,
+		SheetType:    data.SheetType,
+		LastUsedTime: time.Now().Unix(),
+		IsSaved:      true,
+	}, nil
 }
 
 func (am *AttrsManager) Init(d *Dice) {

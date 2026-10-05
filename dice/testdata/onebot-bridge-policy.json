@@ -1,0 +1,17 @@
+{
+  "allowed": [
+    ".r2d7", ".roll 1d1", ".ra侦查", ".st 力量30", ".pc new 我", ".sc 0/1", ".en 侦查", ".set dnd",
+    ".ww 4a10", ".dx 5c10", ".ek 潜行", ".rsr 5", ".coc 10", ".dndx 10", ".dnd", ".ti", ".li", ".userid",
+    ".find 火球术 --page=2 --num=3", ".查询 --rand", ".set info", ".setcoc", ".setcoc details", ".ss", ".buff",
+    ".ds stat", ".死亡豁免 stat", ".init", ".init list", ".jrrp", ".咕咕", ".ping", ".master list", ".master backup",
+    ".ban list", ".ban query QQ:8999999999999999"
+  ],
+  "denied": [
+    ".rh 1d1", ".rah 侦查", ".rxh 1d1", ".rhx 1d1", ".drlh", ".ww set clr", ".ss set 3",
+    ".buff hp:10", ".ds", ".死亡豁免", ".init end", ".setcoc 2", ".find config --group=x", ".find 龙 --whatever",
+    ".coc 11", ".dnd 0", ".r 11#1d1", ".master add me", ".master reboot", ".ban del QQ:8999999999999999",
+    ".rsr", ".rsr 5 extra", ".r 1d1 --anything", ".find help", ".find --page=1", ".dxh 5", ".wh 3", ".wwh 3",
+    ".ban rm QQ:8999999999999999 extra", ".ban add QQ:8999999999999999 two words",
+    ".st hp-1 @other", ".log list", ".send x", ".rav 力量", ".text {1d1}", ".alias a b", ".r 1d1\n.st 力量0"
+  ]
+}

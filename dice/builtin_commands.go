@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -370,10 +371,25 @@ func (d *Dice) registerCoreCommands() {
 					return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 				}
 				reason := cmdArgs.GetArgN(4)
+				if ctx.LLMBridgeRequest != nil && len(cmdArgs.Args) == 3 {
+					// Bridge policy accepts one optional reason after a fully qualified
+					// virtual ID; native add historically reads the fourth argument.
+					reason = cmdArgs.GetArgN(3)
+				}
 				if reason == "" {
 					reason = "骰主指令"
 				}
-				(&d.Config).BanList.AddScoreBase(uid, (&d.Config).BanList.ThresholdBan, "骰主指令", reason, ctx)
+				if ctx.LLMBridgeRequest != nil {
+					if err := persistOnebotBridgeBanMutation(d, uid, func() {
+						(&d.Config).BanList.AddScoreBase(uid, (&d.Config).BanList.ThresholdBan, "骰主指令", reason, ctx)
+					}); err != nil {
+						ctx.LLMBridgeRequest.markFailedAt("ban_persistence_failed")
+						ReplyToSender(ctx, msg, "黑名单操作失败，未能可靠保存")
+						break
+					}
+				} else {
+					(&d.Config).BanList.AddScoreBase(uid, (&d.Config).BanList.ThresholdBan, "骰主指令", reason, ctx)
+				}
 				ReplyToSender(ctx, msg, fmt.Sprintf("已将用户/群组 %s 加入黑名单，原因: %s", uid, reason))
 			case "rm", "del":
 				uid = getID()
@@ -387,9 +403,22 @@ func (d *Dice) registerCoreCommands() {
 					break
 				}
 
-				ReplyToSender(ctx, msg, fmt.Sprintf("已将用户/群组 %s 移出%s列表", uid, BanRankText[item.Rank]))
-				item.Score = 0
-				item.Rank = BanRankNormal
+				previousRank := item.Rank
+				if ctx.LLMBridgeRequest != nil {
+					if err := persistOnebotBridgeBanMutation(d, uid, func() {
+						item.Score = 0
+						item.Rank = BanRankNormal
+						item.UpdatedAt = time.Now().Unix()
+					}); err != nil {
+						ctx.LLMBridgeRequest.markFailedAt("ban_persistence_failed")
+						ReplyToSender(ctx, msg, "黑名单操作失败，未能可靠保存")
+						break
+					}
+				} else {
+					item.Score = 0
+					item.Rank = BanRankNormal
+				}
+				ReplyToSender(ctx, msg, fmt.Sprintf("已将用户/群组 %s 移出%s列表", uid, BanRankText[previousRank]))
 			case "trust":
 				uid = cmdArgs.GetArgN(2)
 				if !strings.Contains(uid, ":") {
@@ -397,7 +426,17 @@ func (d *Dice) registerCoreCommands() {
 					return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 				}
 
-				(&d.Config).BanList.SetTrustByID(uid, "骰主指令", "骰主指令")
+				if ctx.LLMBridgeRequest != nil {
+					if err := persistOnebotBridgeBanMutation(d, uid, func() {
+						(&d.Config).BanList.SetTrustByID(uid, "骰主指令", "骰主指令")
+					}); err != nil {
+						ctx.LLMBridgeRequest.markFailedAt("ban_persistence_failed")
+						ReplyToSender(ctx, msg, "信任列表操作失败，未能可靠保存")
+						break
+					}
+				} else {
+					(&d.Config).BanList.SetTrustByID(uid, "骰主指令", "骰主指令")
+				}
 				ReplyToSender(ctx, msg, fmt.Sprintf("已将用户/群组 %s 加入信任列表", uid))
 			case "list", "show":
 				// ban/warn/trust
@@ -485,6 +524,10 @@ func (d *Dice) registerCoreCommands() {
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			if cmdArgs.IsArgEqual(1, "help") {
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
+			}
+			if d.Parent.Help == nil {
+				ReplyToSender(ctx, msg, "查询资源不可用")
+				return CmdExecuteResult{Matched: true, Solved: true}
 			}
 
 			if d.Parent.IsHelpReloading {
@@ -1299,11 +1342,21 @@ func (d *Dice) registerCoreCommands() {
 			case "backup":
 				ReplyToSender(ctx, msg, "开始备份数据")
 
-				_, err := ctx.Dice.Parent.Backup(ctx.Dice.Parent.AutoBackupSelection, false)
+				bakFn, err := ctx.Dice.Parent.Backup(ctx.Dice.Parent.AutoBackupSelection, false)
+				if err == nil && ctx.LLMBridgeRequest != nil {
+					err = verifyOnebotBridgeBackup(bakFn, ctx.Dice.BaseConfig.DataDir)
+				}
 				if err == nil {
-					ReplyToSender(ctx, msg, "备份成功！请到UI界面(综合设置-备份)处下载备份，或在骰子backup目录下读取")
+					if ctx.LLMBridgeRequest != nil {
+						ReplyToSender(ctx, msg, fmt.Sprintf("本地备份成功，文件名: %s；请从 backups 目录读取", filepath.Base(bakFn)))
+					} else {
+						ReplyToSender(ctx, msg, "备份成功！请到UI界面(综合设置-备份)处下载备份，或在骰子backup目录下读取")
+					}
 				} else {
 					d.Logger.Error("骰子备份:", err)
+					if ctx.LLMBridgeRequest != nil {
+						ctx.LLMBridgeRequest.markFailedAt("native_backup_failed")
+					}
 					ReplyToSender(ctx, msg, "备份失败！错误已写入日志。可能是磁盘已满所致，建议立即进行处理！")
 				}
 			case "checkupdate":
@@ -1404,11 +1457,16 @@ func (d *Dice) registerCoreCommands() {
 				}
 			case "list":
 				var textBuilder strings.Builder
-				for _, i := range ctx.Dice.DiceMasters {
-					// uid := FormatDiceIdQQ(i)
-					textBuilder.WriteString("- ")
-					textBuilder.WriteString(i)
-					textBuilder.WriteString("\n")
+				if tracker := ctx.LLMBridgeRequest; tracker != nil && tracker.connection != nil {
+					for _, id := range tracker.connection.authorizedMasterIDs(tracker.connectionID) {
+						fmt.Fprintf(&textBuilder, "- QQ:%d\n", id)
+					}
+				} else {
+					for _, i := range ctx.Dice.DiceMasters {
+						textBuilder.WriteString("- ")
+						textBuilder.WriteString(i)
+						textBuilder.WriteString("\n")
+					}
 				}
 				text := textBuilder.String()
 				if text == "" {

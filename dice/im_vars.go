@@ -136,6 +136,12 @@ func VarGetValueComputed(ctx *MsgContext, s string) (string, bool) {
 func VarGetValue(ctx *MsgContext, s string) (*ds.VMValue, bool) {
 	name := GetValueNameByAlias(s, aliasMapForCtx(ctx))
 	am := ctx.Dice.AttrsManager
+	loadByID := am.LoadById
+	loadByContext := am.LoadByCtx
+	if ctx.LLMBridgeRequest != nil {
+		loadByID = am.LoadByIdReadOnly
+		loadByContext = am.LoadByCtxReadOnly
+	}
 
 	// 临时变量
 	if strings.HasPrefix(s, "$t") {
@@ -158,20 +164,20 @@ func VarGetValue(ctx *MsgContext, s string) (*ds.VMValue, bool) {
 	// 个人全局变量
 	if strings.HasPrefix(s, "$m") {
 		if ctx.Session != nil && ctx.Player != nil {
-			playerAttrs := lo.Must(am.LoadById(ctx.Player.UserID))
+			playerAttrs := lo.Must(loadByID(ctx.Player.UserID))
 			return playerAttrs.LoadX(name)
 		}
 	}
 
 	// 群变量
 	if ctx.Group != nil && strings.HasPrefix(s, "$g") {
-		groupAttrs := lo.Must(am.LoadById(ctx.Group.GroupID))
+		groupAttrs := lo.Must(loadByID(ctx.Group.GroupID))
 		return groupAttrs.LoadX(s)
 	}
 
 	// 个人群变量
 	if ctx.Player != nil {
-		curAttrs := lo.Must(am.LoadByCtx(ctx))
+		curAttrs := lo.Must(loadByContext(ctx))
 		return curAttrs.LoadX(name)
 	}
 
@@ -296,13 +302,22 @@ func SetTempVars(ctx *MsgContext, qqNickname string) {
 		}
 		VarSetValueInt64(ctx, "$t群组骰子面数", ctx.Group.DiceSideNum)
 		VarSetValueInt64(ctx, "$t当前骰子面数", getDefaultDicePoints(ctx))
+		system := ctx.Group.System
 		if ctx.Group.System == "" {
-			ctx.Group.System = "coc7"
-			ctx.Group.MarkDirty(ctx.Dice)
+			if ctx.LLMBridgeRequest == nil || !ctx.LLMBridgeReadOnly {
+				ctx.Group.System = "coc7"
+				ctx.Group.MarkDirty(ctx.Dice)
+			} else {
+				system = "coc7"
+				ctx.SystemTemplate, _ = ctx.Dice.GameSystemMap.Load(system)
+			}
 		}
-		VarSetValueStr(ctx, "$t游戏模式", ctx.Group.System)
-		VarSetValueStr(ctx, "$t规则模板", ctx.Group.System)
-		VarSetValueStr(ctx, "$tSystem", ctx.Group.System)
+		if system == "" {
+			system = ctx.Group.System
+		}
+		VarSetValueStr(ctx, "$t游戏模式", system)
+		VarSetValueStr(ctx, "$t规则模板", system)
+		VarSetValueStr(ctx, "$tSystem", system)
 		logState := ctx.Group.GetLogState()
 		VarSetValueStr(ctx, "$t当前记录", logState.Name)
 		VarSetValueInt64(ctx, "$t权限等级", int64(ctx.PrivilegeLevel))

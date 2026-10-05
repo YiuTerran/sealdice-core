@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,9 @@ import (
 const (
 	onebotLLMBridgeRegisterAction = "_llm_bridge_register"
 	onebotLLMBridgeCompleteAction = "_llm_bridge_complete"
+	onebotBridgeMasterIDMin       = int64(8_000_000_000_000_000)
+	onebotBridgeMasterIDMax       = int64(9_000_000_000_000_000)
+	onebotBridgeMasterIDLimit     = 100
 )
 
 type onebotBridgeConnection struct {
@@ -31,10 +35,12 @@ type onebotBridgeConnection struct {
 	registerDone chan struct{}
 	registerOnce sync.Once
 
-	mu           sync.RWMutex
-	connectionID string
-	registered   bool
-	closed       bool
+	mu                    sync.RWMutex
+	connectionID          string
+	registered            bool
+	closed                bool
+	masterACLConnectionID string
+	masterUserIDs         map[int64]struct{}
 }
 
 func (c *onebotBridgeConnection) registration() (string, bool) {
@@ -51,9 +57,15 @@ func (c *onebotBridgeConnection) setRegistration(connectionID string, registered
 	if !c.closed {
 		c.connectionID = connectionID
 		c.registered = registered
+		if !registered || c.masterACLConnectionID != connectionID {
+			c.masterACLConnectionID = ""
+			c.masterUserIDs = nil
+		}
 	} else {
 		c.connectionID = ""
 		c.registered = false
+		c.masterACLConnectionID = ""
+		c.masterUserIDs = nil
 	}
 	c.mu.Unlock()
 	c.registerOnce.Do(func() {
@@ -71,12 +83,72 @@ func (c *onebotBridgeConnection) close() {
 	c.closed = true
 	c.connectionID = ""
 	c.registered = false
+	c.masterACLConnectionID = ""
+	c.masterUserIDs = nil
 	c.mu.Unlock()
 	c.registerOnce.Do(func() {
 		if c.registerDone != nil {
 			close(c.registerDone)
 		}
 	})
+}
+
+func (c *onebotBridgeConnection) setMasterAuthorization(connectionID string, authorization *onebotBridgeAuthorization) {
+	if c == nil {
+		return
+	}
+	ids := make(map[int64]struct{})
+	valid := authorization != nil && authorization.Version == 1 && strings.TrimSpace(connectionID) != "" && len(authorization.MasterUserIDs) <= onebotBridgeMasterIDLimit
+	if valid {
+		ids = make(map[int64]struct{}, len(authorization.MasterUserIDs))
+		for _, id := range authorization.MasterUserIDs {
+			if id < onebotBridgeMasterIDMin || id >= onebotBridgeMasterIDMax {
+				valid = false
+				break
+			}
+			ids[id] = struct{}{}
+		}
+	}
+	c.mu.Lock()
+	if !c.closed {
+		c.masterACLConnectionID = ""
+		c.masterUserIDs = nil
+		if valid {
+			c.masterACLConnectionID = connectionID
+			c.masterUserIDs = ids
+		}
+	}
+	c.mu.Unlock()
+}
+
+func (c *onebotBridgeConnection) hasMasterUser(connectionID string, userID int64) bool {
+	if c == nil || userID <= 0 || connectionID == "" {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed || !c.registered || c.connectionID != connectionID || c.masterACLConnectionID != connectionID {
+		return false
+	}
+	_, ok := c.masterUserIDs[userID]
+	return ok
+}
+
+func (c *onebotBridgeConnection) authorizedMasterIDs(connectionID string) []int64 {
+	if c == nil || connectionID == "" {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed || !c.registered || c.connectionID != connectionID || c.masterACLConnectionID != connectionID {
+		return nil
+	}
+	ids := make([]int64, 0, len(c.masterUserIDs))
+	for id := range c.masterUserIDs {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 func (c *onebotBridgeConnection) waitForRegistration() bool {
@@ -113,8 +185,14 @@ type onebotBridgeCompleteParams struct {
 }
 
 type onebotBridgeRegisterResult struct {
-	Version      int    `json:"version"`
-	ConnectionID string `json:"connection_id"`
+	Version       int             `json:"version"`
+	ConnectionID  string          `json:"connection_id"`
+	Authorization json.RawMessage `json:"authorization"`
+}
+
+type onebotBridgeAuthorization struct {
+	Version       int     `json:"version"`
+	MasterUserIDs []int64 `json:"master_user_ids"`
 }
 
 type onebotActionResponse struct {
@@ -362,7 +440,7 @@ func (p *PlatformAdapterOnebot) registerLLMBridgeConnection(conn *onebotBridgeCo
 	params := onebotBridgeRegisterParams{
 		Version:         1,
 		BackendInstance: p.bridgeInstanceID,
-		Capabilities:    []string{"reply", "complete"},
+		Capabilities:    []string{"reply", "complete", "master-acl-v1"},
 	}
 	ctx := conn.ctx
 	if ctx == nil {
@@ -386,6 +464,14 @@ func (p *PlatformAdapterOnebot) registerLLMBridgeConnection(conn *onebotBridgeCo
 	if result.Version != 1 || strings.TrimSpace(result.ConnectionID) == "" {
 		return errors.New("register bridge action returned invalid connection identity")
 	}
+	var authorization *onebotBridgeAuthorization
+	if len(result.Authorization) != 0 && string(result.Authorization) != "null" {
+		var parsed onebotBridgeAuthorization
+		if json.Unmarshal(result.Authorization, &parsed) == nil {
+			authorization = &parsed
+		}
+	}
+	conn.setMasterAuthorization(result.ConnectionID, authorization)
 	conn.setRegistration(result.ConnectionID, true)
 	if _, registered := conn.registration(); !registered {
 		return errors.New("bridge connection closed during registration")

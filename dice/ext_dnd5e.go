@@ -606,6 +606,27 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			if tmpl2, _ := ctx.Dice.GameSystemMap.Load("dnd5e"); tmpl2 != nil {
 				tmpl = tmpl2
 			}
+			if ctx.LLMBridgeRequest != nil && val == "" {
+				attrs, err := ctx.Dice.AttrsManager.LoadByCtxReadOnly(ctx)
+				if err != nil {
+					ReplyToSender(ctx, msg, "当前角色卡不可用")
+					return &CmdExecuteResult{Matched: true, Solved: true}
+				}
+				var items []string
+				attrs.Range(func(key string, value *ds.VMValue) bool {
+					if strings.HasPrefix(key, "$buff_") && value != nil {
+						items = append(items, strings.TrimPrefix(key, "$buff_")+":"+value.ToString())
+					}
+					return true
+				})
+				sort.Strings(items)
+				if len(items) == 0 {
+					ReplyToSender(ctx, msg, "当前没有设置buff")
+				} else {
+					ReplyToSender(ctx, msg, "当前buff:\n"+strings.Join(items, "\n"))
+				}
+				return &CmdExecuteResult{Matched: true, Solved: true}
+			}
 			attrs, _ := ctx.Dice.AttrsManager.LoadByCtx(ctx)
 
 			switch val {
@@ -1129,7 +1150,13 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			val := cmdArgs.GetArgN(1)
 			switch val {
 			case "stat":
-				a, b := deathSaving(mctx, 0, 0)
+				var a, b int64
+				if ctx.LLMBridgeRequest != nil {
+					a, _ = VarGetValueInt64(mctx, "DSS")
+					b, _ = VarGetValueInt64(mctx, "DSF")
+				} else {
+					a, b = deathSaving(mctx, 0, 0)
+				}
 				text := fmt.Sprintf("%s当前的死亡豁免情况: 成功%d 失败%d", getPlayerNameTempFunc(mctx), a, b)
 				ReplyToSender(mctx, msg, text)
 			case "help":
@@ -1484,7 +1511,12 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 			case "", "list":
 				var textOut strings.Builder
 				textOut.WriteString(DiceFormatTmpl(ctx, "DND:先攻_查看_前缀"))
-				riList := (RIList{}).LoadByCurGroup(ctx)
+				var riList RIList
+				if ctx.LLMBridgeRequest != nil {
+					riList = (RIList{}).LoadByCurGroupReadOnly(ctx)
+				} else {
+					riList = (RIList{}).LoadByCurGroup(ctx)
+				}
 
 				round, _ := VarGetValueInt64(ctx, "$g回合数")
 
@@ -1692,12 +1724,32 @@ var dndRiLock sync.Mutex
 
 // LoadByCurGroup 从群信息中加载
 func (lst RIList) LoadByCurGroup(ctx *MsgContext) RIList {
+	return lst.loadByCurGroup(ctx, true)
+}
+
+func (lst RIList) LoadByCurGroupReadOnly(ctx *MsgContext) RIList {
+	return lst.loadByCurGroup(ctx, false)
+}
+
+func (lst RIList) loadByCurGroup(ctx *MsgContext, createIfMissing bool) RIList {
 	am := ctx.Dice.AttrsManager
-	attrs, _ := am.LoadById(ctx.Group.GroupID)
+	var attrs *AttributesItem
+	if createIfMissing {
+		attrs, _ = am.LoadById(ctx.Group.GroupID)
+	} else {
+		attrs, _ = am.LoadByIdReadOnly(ctx.Group.GroupID)
+	}
+	if attrs == nil {
+		return nil
+	}
 
 	dndRiLock.Lock()
 	riList := attrs.Load("riList")
 	if riList == nil || riList.TypeId != ds.VMTypeArray {
+		if !createIfMissing {
+			dndRiLock.Unlock()
+			return nil
+		}
 		riList = ds.NewArrayVal()
 		attrs.Store("riList", riList)
 	}

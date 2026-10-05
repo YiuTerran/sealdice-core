@@ -201,7 +201,7 @@ func TestOnebotBridgeFreshDefaultNativeRoll(t *testing.T) {
 	defer cleanup()
 
 	// Model the isolated fresh-volume startup: use the defaults produced by
-	// NewConfig, register only the two verified native rules, and start with an
+	// NewConfig, register only the reviewed native extensions, and start with an
 	// empty group cache so the first event must create and activate its group.
 	d.onebotBridgeIsolated = true
 	d.onebotBridgeBind = "0.0.0.0:18081"
@@ -211,8 +211,8 @@ func TestOnebotBridgeFreshDefaultNativeRoll(t *testing.T) {
 	d.ExtRegistry = new(SyncMap[string, *ExtInfo])
 	d.registerBuiltinExtForRuntime()
 	d.applyOnebotBridgeIsolation()
-	if len(d.ExtList) != 2 || len(d.Config.ExtDefaultSettings) != 2 {
-		t.Fatalf("fresh bridge fixture registered %d extensions and %d defaults, want two each", len(d.ExtList), len(d.Config.ExtDefaultSettings))
+	if len(d.ExtList) != 3 || len(d.Config.ExtDefaultSettings) != 3 {
+		t.Fatalf("fresh bridge fixture registered %d extensions and %d defaults, want three each", len(d.ExtList), len(d.Config.ExtDefaultSettings))
 	}
 	if _, exists := d.ImSession.ServiceAtNew.Load("QQ-Group:22001"); exists {
 		t.Fatal("fresh bridge fixture unexpectedly has a pre-existing group")

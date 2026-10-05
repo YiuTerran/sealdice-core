@@ -163,6 +163,14 @@ type singleRoulette struct {
 var rouletteMap SyncMap[string, singleRoulette]
 
 func RegisterBuiltinExtFun(self *Dice) {
+	registerBuiltinExtFun(self, false)
+}
+
+func registerBuiltinExtFunForBridge(self *Dice) {
+	registerBuiltinExtFun(self, true)
+}
+
+func registerBuiltinExtFun(self *Dice, bridgeOnly bool) {
 	aliasHelp := ".alias <别名> <指令> // 将 .&<别名> 定义为指定指令的快捷触发方式\n" +
 		".alias --my <别名> <指令> // 将 .&<别名> 定义为个人快捷指令\n" +
 		".alias del/rm <别名> // 删除群快捷指令\n" +
@@ -1350,7 +1358,45 @@ func RegisterBuiltinExtFun(self *Dice) {
 		},
 	}
 
-	self.RegisterExtension(&ExtInfo{
+	cmdMap := CmdMapCls{
+		"alias":   &cmdAlias,
+		"&":       &cmdA,
+		"a":       &cmdA,
+		"ping":    &cmdPing,
+		"send":    &cmdSend,
+		"welcome": &cmdWelcome,
+		"gugu":    &cmdGugu,
+		"咕咕":      &cmdGugu,
+		"jrrp":    &cmdJrrp,
+		"text":    &cmdText,
+		"rsr":     &cmdRsr,
+		"ek":      &cmdEk,
+		"ekgen":   &cmdEkgen,
+		"dx":      &cmdDX,
+		"w":       &cmdWW,
+		"ww":      &cmdWW,
+		"dxh":     &cmdDX,
+		"wh":      &cmdWW,
+		"wwh":     &cmdWW,
+		"jsr":     &cmdJsr,
+		"drl":     &cmdDrl,
+		"drlh":    &cmdDrl,
+		"check":   &cmdCheck,
+	}
+	if bridgeOnly {
+		cmdMap = CmdMapCls{
+			"ping": &cmdPing,
+			"gugu": &cmdGugu,
+			"咕咕":   &cmdGugu,
+			"jrrp": &cmdJrrp,
+			"rsr":  &cmdRsr,
+			"ek":   &cmdEk,
+			"dx":   &cmdDX,
+			"ww":   &cmdWW,
+		}
+	}
+
+	extInfo := &ExtInfo{
 		Name:            "fun", // 扩展的名称，需要用于指令中，写简短点      2024.05.10: 目前被看成是 function 的缩写了（
 		Version:         "1.1.0",
 		Brief:           "功能扩展，主要提供快捷指令、ping、welcome等额外指令，同时也包括今日人品、智能鸽子等娱乐相关指令。同时，小众规则指令暂时也放在本扩展中",
@@ -1388,32 +1434,15 @@ func RegisterBuiltinExtFun(self *Dice) {
 			}
 		},
 		GetDescText: GetExtensionDesc,
-		CmdMap: CmdMapCls{
-			"alias":   &cmdAlias,
-			"&":       &cmdA,
-			"a":       &cmdA,
-			"ping":    &cmdPing,
-			"send":    &cmdSend,
-			"welcome": &cmdWelcome,
-			"gugu":    &cmdGugu,
-			"咕咕":      &cmdGugu,
-			"jrrp":    &cmdJrrp,
-			"text":    &cmdText,
-			"rsr":     &cmdRsr,
-			"ek":      &cmdEk,
-			"ekgen":   &cmdEkgen,
-			"dx":      &cmdDX,
-			"w":       &cmdWW,
-			"ww":      &cmdWW,
-			"dxh":     &cmdDX,
-			"wh":      &cmdWW,
-			"wwh":     &cmdWW,
-			"jsr":     &cmdJsr,
-			"drl":     &cmdDrl,
-			"drlh":    &cmdDrl,
-			"check":   &cmdCheck,
-		},
-	})
+		CmdMap:      cmdMap,
+	}
+	if bridgeOnly {
+		// The bridge gets only reviewed native commands and no message/event hooks.
+		extInfo.OnCommandReceived = nil
+		extInfo.OnLoad = nil
+		extInfo.OnPoke = nil
+	}
+	self.RegisterExtension(extInfo)
 }
 
 func fingerprint(b string) uint64 {

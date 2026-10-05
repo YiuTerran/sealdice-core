@@ -151,7 +151,7 @@ func TestOnebotBridgeIsolationAddsRuntimeOnlyEndpointAndSafeConfig(t *testing.T)
 	}
 }
 
-func TestOnebotBridgeRuntimeRegistersOnlyNativeRuleExtensions(t *testing.T) {
+func TestOnebotBridgeRuntimeRegistersOnlyReviewedNativeExtensions(t *testing.T) {
 	dice := &Dice{
 		onebotBridgeIsolated: true,
 		onebotBridgeBind:     "0.0.0.0:18081",
@@ -161,12 +161,26 @@ func TestOnebotBridgeRuntimeRegistersOnlyNativeRuleExtensions(t *testing.T) {
 		GameSystemMap:        new(SyncMap[string, *GameSystemTemplate]),
 	}
 	dice.registerBuiltinExtForRuntime()
-	if len(dice.ExtList) != 2 || dice.ExtList[0].Name != "coc7" || dice.ExtList[1].Name != "dnd5e" {
-		t.Fatalf("bridge extension registry = %#v, want only coc7 and dnd5e", dice.ExtList)
+	if len(dice.ExtList) != 3 || dice.ExtList[0].Name != "coc7" || dice.ExtList[1].Name != "dnd5e" || dice.ExtList[2].Name != "fun" {
+		t.Fatalf("bridge extension registry = %#v, want coc7, dnd5e, and reviewed fun subset", dice.ExtList)
 	}
 	dice.applyOnebotBridgeIsolation()
-	if len(dice.Config.ExtDefaultSettings) != 2 {
-		t.Fatalf("bridge default extension settings = %#v, want exactly two rules", dice.Config.ExtDefaultSettings)
+	if len(dice.Config.ExtDefaultSettings) != 3 {
+		t.Fatalf("bridge default extension settings = %#v, want exactly three reviewed extensions", dice.Config.ExtDefaultSettings)
+	}
+	fun, _ := dice.ExtRegistry.Load("fun")
+	if fun == nil || fun.OnCommandReceived != nil || fun.OnLoad != nil || fun.OnPoke != nil {
+		t.Fatalf("bridge fun extension retained event hooks: %#v", fun)
+	}
+	for _, command := range []string{"ping", "gugu", "咕咕", "jrrp", "rsr", "ek", "dx", "ww"} {
+		if _, ok := fun.CmdMap[command]; !ok {
+			t.Errorf("reviewed fun command %q was not registered", command)
+		}
+	}
+	for _, command := range []string{"alias", "&", "a", "send", "welcome", "text", "ekgen", "dxh", "wh", "wwh", "rh", "rx"} {
+		if _, ok := fun.CmdMap[command]; ok {
+			t.Errorf("unreviewed fun command %q was registered", command)
+		}
 	}
 
 	type savedBridgeConfig struct {

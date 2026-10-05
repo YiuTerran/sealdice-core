@@ -106,7 +106,7 @@ func validateOnebotBridgeData(dataDir, packageSourceDir, packageCacheDir string)
 			return errors.New("bridge data volume must explicitly disable custom replies")
 		}
 		for _, ext := range config.ExtDefaultSettings {
-			if ext.AutoActive && ext.Name != "coc7" && ext.Name != "dnd5e" {
+			if ext.AutoActive && ext.Name != "coc7" && ext.Name != "dnd5e" && ext.Name != "fun" {
 				return errors.New("bridge data volume has an active extension outside the native rule allowlist")
 			}
 		}
@@ -202,6 +202,7 @@ func (d *Dice) applyOnebotBridgeIsolation() {
 	d.Config.ExtDefaultSettings = []*ExtDefaultSettingItem{
 		{Name: "coc7", AutoActive: true, DisabledCommand: map[string]bool{}},
 		{Name: "dnd5e", AutoActive: true, DisabledCommand: map[string]bool{}},
+		{Name: "fun", AutoActive: true, DisabledCommand: map[string]bool{}},
 	}
 	d.ApplyExtDefaultSettings()
 

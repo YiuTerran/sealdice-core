@@ -508,7 +508,13 @@ func getCmdStBase(soi CmdStOverrideInfo) *CmdItemInfo {
 			val := cmdArgs.GetArgN(1)
 			mctx := GetCtxProxyFirst(ctx, cmdArgs)
 
-			attrs := lo.Must(dice.AttrsManager.LoadByCtx(mctx))
+			var attrs *AttributesItem
+			bridgeReadOnly := ctx.LLMBridgeRequest != nil && (val == "show" || val == "list" || val == "export" || val == "" && soi.HelpPrefix == "属性临时加值，语法同st一致:\n")
+			if bridgeReadOnly {
+				attrs = lo.Must(dice.AttrsManager.LoadByCtxReadOnly(mctx))
+			} else {
+				attrs = lo.Must(dice.AttrsManager.LoadByCtx(mctx))
+			}
 			cardType := ReadCardType(mctx)
 
 			tmpl := ctx.Group.GetCharTemplate(dice)

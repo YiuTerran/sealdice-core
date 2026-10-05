@@ -137,6 +137,7 @@ func (d *Dice) registerBuiltinExtForRuntime() {
 	if d.onebotBridgeIsolated {
 		RegisterBuiltinExtCoc7(d)
 		RegisterBuiltinExtDnd5e(d)
+		registerBuiltinExtFunForBridge(d)
 		d.RegisterBuiltinSystemTemplate()
 		return
 	}

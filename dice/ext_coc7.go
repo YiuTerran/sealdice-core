@@ -374,6 +374,35 @@ func RegisterBuiltinExtCoc7(self *Dice) {
 		},
 		Solve: func(ctx *MsgContext, msg *Message, cmdArgs *CmdArgs) CmdExecuteResult {
 			n := cmdArgs.GetArgN(1)
+			if ctx.LLMBridgeRequest != nil {
+				switch n {
+				case "":
+					index := ctx.Group.CocRuleIndex
+					if index < 0 || index >= len(SetCocRulePrefixText) || index >= len(SetCocRuleText) {
+						ReplyToSender(ctx, msg, "当前房规信息不可用")
+					} else {
+						ReplyToSender(ctx, msg, fmt.Sprintf("当前COC房规为%s:\n%s", SetCocRulePrefixText[index], SetCocRuleText[index]))
+					}
+					return CmdExecuteResult{Matched: true, Solved: true}
+				case "details":
+					var help strings.Builder
+					help.WriteString("当前有coc7规则如下:\n")
+					for i := range 6 {
+						basicStr := strings.ReplaceAll(SetCocRuleText[i], "\n", " ")
+						fmt.Fprintf(&help, ".setcoc %d // %s\n", i, basicStr)
+					}
+					dgStr := strings.ReplaceAll(SetCocRuleText[11], "\n", " ")
+					fmt.Fprintf(&help, ".setcoc dg // %s\n", dgStr)
+					for _, rule := range ctx.Dice.CocExtraRules {
+						ruleText := strings.ReplaceAll(rule.Desc, "\n", " ")
+						fmt.Fprintf(&help, ".setcoc %d/%s // %s\n", rule.Index, rule.Key, ruleText)
+					}
+					ReplyToSender(ctx, msg, help.String())
+					return CmdExecuteResult{Matched: true, Solved: true}
+				default:
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
+			}
 			suffix := "\nCOC7规则扩展已自动开启"
 			setRuleByName(ctx, "coc7")
 

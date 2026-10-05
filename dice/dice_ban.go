@@ -2,6 +2,7 @@ package dice
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -42,6 +43,38 @@ type BanListInfoItem struct {
 
 	BanUpdatedAt int64 `json:"-"` // 排序依据，不过可能和bantime重复？
 	UpdatedAt    int64 `json:"-"` // 数据更新时间
+}
+
+func cloneBanListInfoItem(item *BanListInfoItem) *BanListInfoItem {
+	if item == nil {
+		return nil
+	}
+	copyItem := *item
+	copyItem.Times = append([]int64(nil), item.Times...)
+	copyItem.Reasons = append([]string(nil), item.Reasons...)
+	copyItem.Places = append([]string(nil), item.Places...)
+	return &copyItem
+}
+
+func persistOnebotBridgeBanMutation(d *Dice, id string, mutate func()) error {
+	if d == nil || d.Config.BanList == nil || mutate == nil {
+		return errors.New("ban list is unavailable")
+	}
+	list := d.Config.BanList
+	list.bridgeMutationMu.Lock()
+	defer list.bridgeMutationMu.Unlock()
+	previous, existed := list.Map.Load(id)
+	previous = cloneBanListInfoItem(previous)
+	mutate()
+	if err := list.SaveItemChecked(d, id); err != nil {
+		if existed {
+			list.Map.Store(id, previous)
+		} else {
+			list.Map.Delete(id)
+		}
+		return err
+	}
+	return nil
 }
 
 var BanRankText = map[BanRankType]string{
@@ -90,6 +123,7 @@ type BanListInfo struct {
 	banNoticeMu       sync.Mutex                             `json:"-" yaml:"-"`
 	banNoticeAt       map[blacklistedUserNoticeKey]time.Time `json:"-" yaml:"-"`
 	cronID            cron.EntryID                           `json:"-" yaml:"-"`
+	bridgeMutationMu  sync.Mutex                             `json:"-" yaml:"-"`
 }
 
 func (i *BanListInfo) Init() {
@@ -505,16 +539,59 @@ func (d *Dice) GetBanList() []*BanListInfoItem {
 }
 
 func (i *BanListInfo) SaveChanged(d *Dice) {
-	(&d.Config).BanList.Map.Range(func(k string, v *BanListInfoItem) bool {
+	_ = i.SaveChangedChecked(d)
+}
+
+func (i *BanListInfo) SaveChangedChecked(d *Dice) error {
+	if i == nil || d == nil || d.DBOperator == nil {
+		return errors.New("ban list storage is unavailable")
+	}
+	i.bridgeMutationMu.Lock()
+	defer i.bridgeMutationMu.Unlock()
+	var saveErrors []error
+	i.Map.Range(func(k string, v *BanListInfoItem) bool {
 		if v.UpdatedAt != 0 {
 			data, err := json.Marshal(v)
 			if err == nil {
-				_ = service.BanItemSave(d.DBOperator, k, v.UpdatedAt, v.BanUpdatedAt, data)
+				err = service.BanItemSave(d.DBOperator, k, v.UpdatedAt, v.BanUpdatedAt, data)
+			}
+			if err != nil {
+				saveErrors = append(saveErrors, fmt.Errorf("save ban entry %s: %w", k, err))
+			} else {
 				v.UpdatedAt = 0
 			}
 		}
 		return true
 	})
+	return errors.Join(saveErrors...)
+}
+
+// SaveItemChecked persists only the requested dirty ban record. Bridge admin
+// commands use this scoped write so unrelated dirty records cannot cause a
+// committed target mutation to be rolled back only in memory.
+func (i *BanListInfo) SaveItemChecked(d *Dice, id string) error {
+	if i == nil || d == nil || d.DBOperator == nil || i.Map == nil {
+		return errors.New("ban list storage is unavailable")
+	}
+	item, ok := i.Map.Load(id)
+	if !ok || item == nil {
+		return fmt.Errorf("ban entry %s is unavailable", id)
+	}
+	if item.UpdatedAt == 0 {
+		return fmt.Errorf("ban entry %s is not marked dirty", id)
+	}
+	updatedAt := item.UpdatedAt
+	data, err := json.Marshal(item)
+	if err != nil {
+		return fmt.Errorf("encode ban entry %s: %w", id, err)
+	}
+	if err := service.BanItemSave(d.DBOperator, id, updatedAt, item.BanUpdatedAt, data); err != nil {
+		return fmt.Errorf("save ban entry %s: %w", id, err)
+	}
+	if current, stillPresent := i.Map.Load(id); stillPresent && current == item && item.UpdatedAt == updatedAt {
+		item.UpdatedAt = 0
+	}
+	return nil
 }
 
 func (i *BanListInfo) DeleteByID(d *Dice, id string) {
