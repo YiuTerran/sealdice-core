@@ -71,6 +71,81 @@ func TestOnebotBridgePolicyMatchesSharedFixture(t *testing.T) {
 	}
 }
 
+func TestOnebotBridgeSetCommandExecuteNewLifecycle(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	if err := d.DBOperator.GetDataDB(constant.WRITE).AutoMigrate(&model.GroupPlayerInfoBase{}); err != nil {
+		t.Fatal(err)
+	}
+	em := &onebotBridgeCaptureEmitter{completeCh: make(chan onebotBridgeCompleteParams, 8)}
+	pa := &PlatformAdapterOnebot{EndPoint: ep, LLMBridgeEnabled: true, logger: d.Logger}
+	ep.Adapter = pa
+	ep.Session = d.ImSession
+
+	testCases := []struct {
+		name       string
+		audience   string
+		command    string
+		wantStatus string
+		wantOutput bool
+	}{
+		{name: "group info", audience: "group", command: ".set info", wantStatus: "ok", wantOutput: true},
+		{name: "private info", audience: "private", command: ".set info", wantStatus: "ok", wantOutput: true},
+		{name: "group clear denied", audience: "group", command: ".set clr", wantStatus: "failed"},
+		{name: "group numeric setting denied", audience: "group", command: ".set 123", wantStatus: "failed"},
+		{name: "private rule selection denied", audience: "private", command: ".set coc", wantStatus: "failed"},
+	}
+	for i, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			const userID int64 = 22101
+			const groupID int64 = 22102
+			sourceID := int64(601 + i)
+			_, tracker := newOnebotBridgeTestTracker(t, pa, em, testCase.audience, sourceID, userID, groupID, "set-info-"+strconvFormatInt(sourceID))
+			var msg *Message
+			if testCase.audience == "group" {
+				msg = newGroupMsg("QQ-Group:"+strconvFormatInt(groupID), "QQ:"+strconvFormatInt(userID), testCase.command)
+			} else {
+				msg = newPrivateMsg("QQ:"+strconvFormatInt(userID), testCase.command)
+			}
+			msg.RawID = sourceID
+			msg.LLMBridgeRequest = tracker
+
+			em.mu.Lock()
+			sendsBefore := len(em.sends)
+			em.mu.Unlock()
+			d.ImSession.ExecuteNew(ep, msg)
+			// ExecuteNew's bridge branch is normally enclosed by the incoming
+			// OneBot event's defer; mirror it here so rejected commands complete too.
+			tracker.finishTask()
+
+			var completion onebotBridgeCompleteParams
+			select {
+			case completion = <-em.completeCh:
+			case <-time.After(2 * time.Second):
+				t.Fatal("bridge command did not complete")
+			}
+			if completion.Status != testCase.wantStatus {
+				t.Fatalf("completion status = %q, want %q: %#v", completion.Status, testCase.wantStatus, completion)
+			}
+			if testCase.wantOutput && completion.OutputCount == 0 {
+				t.Fatalf("approved query completed without a native reply: %#v", completion)
+			}
+			if !testCase.wantOutput && completion.OutputCount != 0 {
+				t.Fatalf("rejected state-changing command emitted output: %#v", completion)
+			}
+			em.mu.Lock()
+			sendCount := len(em.sends) - sendsBefore
+			em.mu.Unlock()
+			if testCase.wantOutput && sendCount == 0 {
+				t.Fatal("approved query was not delivered through the bridge emitter")
+			}
+			if !testCase.wantOutput && sendCount != 0 {
+				t.Fatalf("rejected command sent %d replies", sendCount)
+			}
+		})
+	}
+}
+
 func TestOnebotBridgeMasterACLIsBoundedToConnection(t *testing.T) {
 	const connectionID = "master-acl-connection"
 	userID := onebotBridgeMasterIDMin + 1

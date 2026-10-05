@@ -156,10 +156,6 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 		tracker.markFailedAt("command_not_allowed")
 		return
 	}
-	if command == "set" && !isOnebotBridgeRuleSelection(mctx, cmdArgs) {
-		tracker.markFailedAt("set_not_rule_selection")
-		return
-	}
 	banMessage := *msg
 	banMessage.Message = ""
 	if checkBan(mctx, &banMessage) || mctx.PrivilegeLevel == -30 {
