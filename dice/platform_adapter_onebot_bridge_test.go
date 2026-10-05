@@ -342,7 +342,7 @@ func TestOnebotBridgeIgnoresGensokyoMetaEventsWithoutWarning(t *testing.T) {
 	pa := &PlatformAdapterOnebot{LLMBridgeEnabled: true, logger: zap.New(core).Sugar()}
 	// A nil Kws makes any event that reaches dispatch panic. These control
 	// events must be dropped at the bridge gate before dispatching to handlers.
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		for _, metaType := range []string{"heartbeat", "lifecycle"} {
 			raw := []byte(`{"post_type":"meta_event","meta_event_type":"` + metaType + `","private":"heartbeat-lifecycle-sentinel"}`)
 			func() {
