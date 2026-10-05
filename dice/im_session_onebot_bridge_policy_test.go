@@ -1,6 +1,8 @@
+//nolint:testpackage // These tests exercise private bridge policy and native solver behavior.
 package dice
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -332,33 +334,179 @@ func TestOnebotBridgeBackupVerifierChecksNativeArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	dbPath := filepath.Join(d.BaseConfig.DataDir, "data.db")
-	dataDB, err := openTestGormDB(dbPath)
-	if err != nil {
-		t.Fatal(err)
+	dataDB, openErr := openTestGormDB(dbPath)
+	if openErr != nil {
+		t.Fatal(openErr)
 	}
-	if sqlDB, err := dataDB.DB(); err == nil {
+	if sqlDB, dbErr := dataDB.DB(); dbErr == nil {
 		_ = sqlDB.Close()
 	}
-	oldWD, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
 	backupRoot := t.TempDir()
-	if err := os.Chdir(backupRoot); err != nil {
+	t.Chdir(backupRoot)
+	if err := os.MkdirAll(filepath.Join(backupRoot, "data"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chdir(oldWD) })
-	backupPath, err := d.Parent.Backup(BackupSelectionBasic, false)
-	if err != nil {
-		t.Fatalf("create native backup: %v", err)
+	if err := os.WriteFile(filepath.Join(backupRoot, "data", "dice.yaml"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if err := verifyOnebotBridgeBackup(backupPath, d.BaseConfig.DataDir); err != nil {
-		t.Fatalf("native backup did not pass verification: %v", err)
+	if err := os.WriteFile(filepath.Join(d.BaseConfig.DataDir, "data-logs.db"), []byte("log db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backupPath, backupErr := d.Parent.Backup(BackupSelectionBasic, false)
+	if backupErr != nil {
+		t.Fatalf("create native backup: %v", backupErr)
+	}
+	if verifyErr := verifyOnebotBridgeBackup(backupPath, d.BaseConfig.DataDir); verifyErr != nil {
+		t.Fatalf("native backup did not pass verification: %v", verifyErr)
 	}
 	if err := os.WriteFile(filepath.Join(backupRoot, backupPath), []byte("not a zip"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyOnebotBridgeBackup(backupPath, d.BaseConfig.DataDir); err == nil {
+	if verifyErr := verifyOnebotBridgeBackup(backupPath, d.BaseConfig.DataDir); verifyErr == nil {
 		t.Fatal("corrupted native backup passed verification")
+	}
+}
+
+func TestOnebotBridgeMasterBackupSolverWithHeadlessAllSelection(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	d.Parent.AutoBackupSelection = BackupSelectionAll
+
+	root := t.TempDir()
+	t.Chdir(root)
+	globalDataDir := filepath.Join(root, "data")
+	diceDataDir := filepath.Join(globalDataDir, "default")
+	if err := os.MkdirAll(diceDataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		filepath.Join(globalDataDir, "dice.yaml"):     "{}\n",
+		filepath.Join(diceDataDir, "serve.yaml"):      "{}\n",
+		filepath.Join(diceDataDir, "data.db"):         "test data db",
+		filepath.Join(diceDataDir, "data-logs.db"):    "test log db",
+		filepath.Join(diceDataDir, "configs", "seed"): "optional config directory",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.BaseConfig.DataDir = diceDataDir
+
+	msg := newPrivateMsg("QQ:8999999999999998", ".master backup")
+	ctx := &MsgContext{
+		Dice:             d,
+		MessageType:      "private",
+		IsPrivate:        true,
+		EndPoint:         ep,
+		Session:          d.ImSession,
+		PrivilegeLevel:   100,
+		LLMBridgeRequest: &onebotBridgeRequestTracker{},
+		Group:            &GroupInfo{GroupID: "PG-" + msg.Sender.UserID},
+		Player:           &GroupPlayerInfo{UserID: msg.Sender.UserID},
+	}
+	args := (&CmdArgs{}).commandParseNew(ctx, msg, true)
+	if args == nil || args.Command != "master" {
+		t.Fatalf("native master command parser returned %#v", args)
+	}
+	command := d.CmdMap["master"]
+	if command == nil {
+		t.Fatal("native master solver is unavailable")
+	}
+	result := command.Solve(ctx, msg, args)
+	if !result.Matched || !result.Solved {
+		t.Fatalf("native master solver result = %#v", result)
+	}
+
+	adapter.mu.Lock()
+	var backupSucceeded bool
+	for _, text := range adapter.personMsgs {
+		if strings.Contains(text, "本地备份成功") {
+			backupSucceeded = true
+		}
+	}
+	adapter.mu.Unlock()
+	if !backupSucceeded {
+		t.Fatalf("headless .master backup did not report verified success; replies=%q", adapter.personMsgs)
+	}
+
+	for path, content := range map[string]string{
+		filepath.Join(root, "data", "decks", "test.deck"): "deck payload",
+		filepath.Join(root, "data", "images", "test.png"): "image payload",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resourceBackup, backupErr := d.Parent.Backup(BackupSelectionAll, true)
+	if backupErr != nil {
+		t.Fatalf("backup with existing resources failed: %v", backupErr)
+	}
+	archiveFile, openErr := os.Open(filepath.Join(root, resourceBackup))
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	archiveInfo, statErr := archiveFile.Stat()
+	if statErr != nil {
+		_ = archiveFile.Close()
+		t.Fatal(statErr)
+	}
+	resourceArchive, zipErr := zip.NewReader(archiveFile, archiveInfo.Size())
+	_ = archiveFile.Close()
+	if zipErr != nil {
+		t.Fatal(zipErr)
+	}
+	entries := make(map[string]struct{}, len(resourceArchive.File))
+	for _, entry := range resourceArchive.File {
+		entries[entry.Name] = struct{}{}
+	}
+	for _, wanted := range []string{"data/decks/test.deck", "data/images/test.png"} {
+		if _, exists := entries[wanted]; !exists {
+			t.Errorf("backup archive omitted existing resource %q", wanted)
+		}
+	}
+}
+
+func TestDiceManagerBackupReturnsOptionalResourceStatErrors(t *testing.T) {
+	d, _, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	root := t.TempDir()
+	t.Chdir(root)
+	globalDataDir := filepath.Join(root, "data")
+	diceDataDir := filepath.Join(globalDataDir, "default")
+	if err := os.MkdirAll(diceDataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		filepath.Join(globalDataDir, "dice.yaml"):  "{}\n",
+		filepath.Join(diceDataDir, "serve.yaml"):   "{}\n",
+		filepath.Join(diceDataDir, "data.db"):      "test data db",
+		filepath.Join(diceDataDir, "data-logs.db"): "test log db",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.BaseConfig.DataDir = diceDataDir
+	for _, link := range []string{
+		filepath.Join(globalDataDir, "helpdoc"),
+		filepath.Join(diceDataDir, "advanced.yaml"),
+	} {
+		if err := os.Symlink(filepath.Base(link), link); err != nil {
+			t.Skipf("symlinks unavailable for stat error regression: %v", err)
+		}
+	}
+
+	_, backupErr := d.Parent.Backup(BackupSelectionHelpDoc, false)
+	if backupErr == nil || !strings.Contains(backupErr.Error(), "helpdoc") || !strings.Contains(backupErr.Error(), "advanced.yaml") {
+		t.Fatalf("non-ENOENT resource stat errors were not reported: %v", backupErr)
 	}
 }

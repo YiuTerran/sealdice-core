@@ -82,8 +82,16 @@ const (
 )
 
 func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error) {
-	_ = os.MkdirAll(BackupDir, 0o755)
-	logger := dm.Dice[0].Logger
+	if dm == nil || len(dm.Dice) == 0 || dm.Dice[0] == nil {
+		return "", errors.New("no Dice instance is available for backup")
+	}
+	if err := os.MkdirAll(BackupDir, 0o755); err != nil {
+		return "", fmt.Errorf("create backup directory: %w", err)
+	}
+	backupLogger := dm.Dice[0].Logger
+	if backupLogger == nil {
+		backupLogger = logger.M()
+	}
 
 	cfgGlb := backupConfigGlobal{
 		Global: true,
@@ -110,56 +118,99 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = fzip.Close() }()
 
 	writer := zip.NewWriter(fzip)
-	defer func(writer *zip.Writer) {
-		_ = writer.Close()
-	}(writer)
-
-	fileOK := func(fn string) bool {
-		stat, err := os.Stat(fn)
-		return err == nil && !stat.IsDir()
+	archiveClosed := false
+	defer func() {
+		if !archiveClosed {
+			_ = writer.Close()
+			_ = fzip.Close()
+		}
+	}()
+	var backupErrors []error
+	recordBackupError := func(d *Dice, filename string, err error) {
+		if err == nil {
+			return
+		}
+		backupErrors = append(backupErrors, fmt.Errorf("backup %s: %w", filename, err))
+		if d != nil && d.Logger != nil {
+			d.Logger.Errorf("备份文件失败: %s, 原因: %s", filename, err.Error())
+		} else {
+			backupLogger.Errorf("备份文件失败: %s, 原因: %s", filename, err.Error())
+		}
 	}
-	dirOK := func(fn string) bool {
-		stat, err := os.Stat(fn)
-		return err == nil && stat.IsDir()
+	optionalDirectory := func(root string) (bool, error) {
+		info, err := os.Stat(root)
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !info.IsDir() {
+			return false, fmt.Errorf("%s is not a directory", root)
+		}
+		return true, nil
+	}
+	optionalFile := func(root string) (bool, error) {
+		info, err := os.Stat(root)
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if info.IsDir() {
+			return false, fmt.Errorf("%s is a directory", root)
+		}
+		return true, nil
+	}
+	walkFilesIfPresent := func(root string, walkFn filepath.WalkFunc) error {
+		exists, err := optionalDirectory(root)
+		if err != nil || !exists {
+			return err
+		}
+		return filepath.Walk(root, walkFn)
+	}
+	walkDirsIfPresent := func(root string, walkFn fs.WalkDirFunc) error {
+		exists, err := optionalDirectory(root)
+		if err != nil || !exists {
+			return err
+		}
+		return filepath.WalkDir(root, walkFn)
 	}
 
 	backup := func(d *Dice, fn string) {
 		file, err := os.Open(fn)
-		if err != nil && !strings.Contains(fn, "session.token") {
-			if d != nil {
-				d.Logger.Errorf("备份文件失败: %s, 原因: %s", fn, err.Error())
-			} else {
-				logger.Errorf("备份文件失败: %s, 原因: %s", fn, err.Error())
-			}
+		if errors.Is(err, fs.ErrNotExist) && strings.HasSuffix(filepath.ToSlash(fn), "/session.token") {
+			// In-pack client session tokens are optional and must never cause a
+			// nil-file panic when backing up a headless/container instance.
 			return
 		}
-		defer file.Close()
+		if err != nil {
+			recordBackupError(d, fn, err)
+			return
+		}
 
 		h := &zip.FileHeader{Name: fn, Method: zip.Deflate, Flags: 0x800}
 		fileWriter, err := writer.CreateHeader(h)
 		if err != nil {
-			if d != nil {
-				d.Logger.Errorf("备份文件失败: %s, 原因: %s", fn, err.Error())
-			} else {
-				logger.Errorf("备份文件失败: %s, 原因: %s", fn, err.Error())
-			}
+			recordBackupError(d, fn, errors.Join(err, file.Close()))
 			return
 		}
 
-		_, err = io.Copy(fileWriter, file)
-		if err != nil {
-			if d != nil {
-				d.Logger.Errorf("备份文件失败: %s, 原因: %s", fn, err.Error())
-			} else {
-				logger.Errorf("备份文件失败: %s, 原因: %s", fn, err.Error())
-			}
-		}
+		_, copyErr := io.Copy(fileWriter, file)
+		closeErr := file.Close()
+		recordBackupError(d, fn, errors.Join(copyErr, closeErr))
 	}
 
-	backupDir := func(path string, info fs.FileInfo, _ error) error {
+	backupDir := func(path string, info fs.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info == nil {
+			return fmt.Errorf("missing file information for %s", path)
+		}
 		if !info.IsDir() {
 			backup(nil, path)
 		}
@@ -170,7 +221,13 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 
 	if sel&BackupSelectionDecks != 0 {
 		cfgGlb.Decks = true
-		_ = filepath.Walk("data/decks", func(path string, info fs.FileInfo, _ error) error {
+		walkErr := walkFilesIfPresent("data/decks", func(path string, info fs.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if info == nil {
+				return fmt.Errorf("missing file information for %s", path)
+			}
 			if !info.IsDir() {
 				backup(nil, path)
 				return nil
@@ -178,47 +235,59 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 			base := filepath.Base(path)
 			// 跳过 deck 压缩包解压出的目录
 			if strings.HasPrefix(base, "_") && strings.HasSuffix(base, ".deck") {
-				if fileOK(filepath.Join(filepath.Dir(path), base[1:])) {
+				deckArchive := filepath.Join(filepath.Dir(path), base[1:])
+				if exists, statErr := optionalFile(deckArchive); statErr != nil {
+					recordBackupError(nil, deckArchive, statErr)
+				} else if exists {
 					return filepath.SkipDir
 				}
 			}
 			return nil
 		})
+		recordBackupError(nil, "data/decks", walkErr)
 	}
 
 	if sel&BackupSelectionHelpDoc != 0 {
-		if !dirOK("data/helpdoc") {
-			logger.Warn("备份 helpdoc 失败: 不存在或不是目录")
+		if exists, statErr := optionalDirectory("data/helpdoc"); statErr != nil {
+			recordBackupError(nil, "data/helpdoc", statErr)
+		} else if !exists {
+			backupLogger.Warn("备份 helpdoc 失败: 不存在或不是目录")
 		} else {
 			cfgGlb.HelpDoc = true
-			_ = filepath.Walk("data/helpdoc", backupDir)
+			recordBackupError(nil, "data/helpdoc", walkFilesIfPresent("data/helpdoc", backupDir))
 		}
 	}
 
 	if sel&BackupSelectionCensor != 0 {
-		if !dirOK("data/censor") {
-			logger.Warn("备份 censor 失败: 不存在或不是目录")
+		if exists, statErr := optionalDirectory("data/censor"); statErr != nil {
+			recordBackupError(nil, "data/censor", statErr)
+		} else if !exists {
+			backupLogger.Warn("备份 censor 失败: 不存在或不是目录")
 		} else {
 			cfgGlb.Censor = true
-			_ = filepath.Walk("data/censor", backupDir)
+			recordBackupError(nil, "data/censor", walkFilesIfPresent("data/censor", backupDir))
 		}
 	}
 
 	if sel&BackupSelectionNames != 0 {
-		if !dirOK("data/names") {
-			logger.Warn("备份 names 失败: 不存在或不是目录")
+		if exists, statErr := optionalDirectory("data/names"); statErr != nil {
+			recordBackupError(nil, "data/names", statErr)
+		} else if !exists {
+			backupLogger.Warn("备份 names 失败: 不存在或不是目录")
 		} else {
 			cfgGlb.Names = true
-			_ = filepath.Walk("data/names", backupDir)
+			recordBackupError(nil, "data/names", walkFilesIfPresent("data/names", backupDir))
 		}
 	}
 
 	if sel&BackupSelectionImages != 0 {
-		if !dirOK("data/images") {
-			logger.Warn("备份 images 失败: 不存在或不是目录")
+		if exists, statErr := optionalDirectory("data/images"); statErr != nil {
+			recordBackupError(nil, "data/images", statErr)
+		} else if !exists {
+			backupLogger.Warn("备份 images 失败: 不存在或不是目录")
 		} else {
 			cfgGlb.Images = true
-			_ = filepath.Walk("data/images", backupDir)
+			recordBackupError(nil, "data/images", walkFilesIfPresent("data/images", backupDir))
 		}
 	}
 
@@ -226,41 +295,66 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 	cfgDice.JSScripts = withJS
 
 	for _, d := range dm.Dice {
+		if d == nil {
+			recordBackupError(nil, "Dice instance", errors.New("nil Dice instance"))
+			continue
+		}
 		cfgGlb.Dices[d.BaseConfig.Name] = &cfgDice
 		dataDir := d.BaseConfig.DataDir
+		if d.DBOperator == nil {
+			recordBackupError(d, dataDir, errors.New("database operator is unavailable"))
+			continue
+		}
 
 		backup(d, filepath.Join(dataDir, "serve.yaml"))
-		if fn := filepath.Join(dataDir, "advanced.yaml"); fileOK(fn) {
-			backup(d, fn)
+		advancedConfig := filepath.Join(dataDir, "advanced.yaml")
+		if exists, statErr := optionalFile(advancedConfig); statErr != nil {
+			recordBackupError(d, advancedConfig, statErr)
+		} else if exists {
+			backup(d, advancedConfig)
 		}
-		if fn := filepath.Join(dataDir, "configs", "plugin-configs.json"); fileOK(fn) {
-			backup(d, fn)
+		pluginConfig := filepath.Join(dataDir, "configs", "plugin-configs.json")
+		if exists, statErr := optionalFile(pluginConfig); statErr != nil {
+			recordBackupError(d, pluginConfig, statErr)
+		} else if exists {
+			backup(d, pluginConfig)
 		}
 
 		err := service.FlushWAL(d.DBOperator.GetDataDB(constant.WRITE))
 		if err != nil {
-			d.Logger.Errorf("备份时data数据库flush出错 错误为:%v", err.Error())
+			recordBackupError(d, filepath.Join(dataDir, "data.db"), err)
 		} else {
 			backup(d, filepath.Join(dataDir, "data.db"))
 		}
 		err = service.FlushWAL(d.DBOperator.GetLogDB(constant.WRITE))
 		if err != nil {
-			d.Logger.Errorf("备份时logs数据库flush出错 错误为:%v", err.Error())
+			recordBackupError(d, filepath.Join(dataDir, "data-logs.db"), err)
 		} else {
 			backup(d, filepath.Join(dataDir, "data-logs.db"))
 		}
 		if d.CensorManager != nil && d.CensorManager.DB != nil {
 			err = service.FlushWAL(d.DBOperator.GetCensorDB(constant.WRITE))
 			if err != nil {
-				d.Logger.Errorf("备份时censor数据库flush出错 %v", err.Error())
+				recordBackupError(d, filepath.Join(dataDir, "data-censor.db"), err)
 			} else {
 				backup(d, filepath.Join(dataDir, "data-censor.db"))
 			}
 		}
 
-		backup(d, filepath.Join(dataDir, "configs/text-template.yaml"))
+		textTemplate := filepath.Join(dataDir, "configs/text-template.yaml")
+		if exists, statErr := optionalFile(textTemplate); statErr != nil {
+			recordBackupError(d, textTemplate, statErr)
+		} else if exists {
+			backup(d, textTemplate)
+		}
 
-		_ = filepath.WalkDir(filepath.Join(dataDir, "extensions/reply"), func(path string, info fs.DirEntry, _ error) error {
+		replyWalkErr := walkDirsIfPresent(filepath.Join(dataDir, "extensions/reply"), func(path string, info fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if info == nil {
+				return fmt.Errorf("missing file information for %s", path)
+			}
 			// NOTE(Xiangze Li): copied from dice.ReplyReload. Should extract as function, but I'm lazy
 			if info.IsDir() {
 				if strings.EqualFold(info.Name(), "assets") || strings.EqualFold(info.Name(), "images") {
@@ -278,26 +372,35 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 			}
 			return nil
 		})
+		recordBackupError(d, filepath.Join(dataDir, "extensions/reply"), replyWalkErr)
 
-		for _, i := range d.ImSession.EndPoints {
-			if i.Platform == "QQ" {
-				if pa, ok := i.Adapter.(*PlatformAdapterGocq); ok && pa.UseInPackClient {
-					workDir := i.RelWorkDir
-					if pa.BuiltinMode == "lagrange" {
-						backup(d, filepath.Join(dataDir, workDir, "appsettings.json"))
-						backup(d, filepath.Join(dataDir, workDir, "device.json"))
-						backup(d, filepath.Join(dataDir, workDir, "keystore.json"))
-					} else {
-						backup(d, filepath.Join(dataDir, workDir, "config.yml"))
-						backup(d, filepath.Join(dataDir, workDir, "device.json"))
-						backup(d, filepath.Join(dataDir, workDir, "session.token"))
+		if d.ImSession != nil {
+			for _, i := range d.ImSession.EndPoints {
+				if i.Platform == "QQ" {
+					if pa, ok := i.Adapter.(*PlatformAdapterGocq); ok && pa.UseInPackClient {
+						workDir := i.RelWorkDir
+						if pa.BuiltinMode == "lagrange" {
+							backup(d, filepath.Join(dataDir, workDir, "appsettings.json"))
+							backup(d, filepath.Join(dataDir, workDir, "device.json"))
+							backup(d, filepath.Join(dataDir, workDir, "keystore.json"))
+						} else {
+							backup(d, filepath.Join(dataDir, workDir, "config.yml"))
+							backup(d, filepath.Join(dataDir, workDir, "device.json"))
+							backup(d, filepath.Join(dataDir, workDir, "session.token"))
+						}
 					}
 				}
 			}
 		}
 
 		if withJS {
-			_ = filepath.WalkDir(filepath.Join(dataDir, "scripts"), func(path string, info fs.DirEntry, _ error) error {
+			scriptsWalkErr := walkDirsIfPresent(filepath.Join(dataDir, "scripts"), func(path string, info fs.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				if info == nil {
+					return fmt.Errorf("missing file information for %s", path)
+				}
 				if info.IsDir() {
 					if info.Name() == "_builtin" {
 						return filepath.SkipDir
@@ -309,8 +412,15 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 				}
 				return nil
 			})
+			recordBackupError(d, filepath.Join(dataDir, "scripts"), scriptsWalkErr)
 			extDataDir := filepath.Join(dataDir, "extensions")
-			_ = filepath.WalkDir(extDataDir, func(path string, info fs.DirEntry, err error) error {
+			extWalkErr := walkDirsIfPresent(extDataDir, func(path string, info fs.DirEntry, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				if info == nil {
+					return fmt.Errorf("missing file information for %s", path)
+				}
 				if info.IsDir() {
 					if filepath.Dir(path) == extDataDir {
 						if ext := d.ExtFind(info.Name(), false); ext == nil || !ext.IsJsExt {
@@ -322,19 +432,37 @@ func (dm *DiceManager) Backup(sel BackupSelection, fromAuto bool) (string, error
 				backup(d, path)
 				return nil
 			})
+			recordBackupError(d, extDataDir, extWalkErr)
 		}
 	}
 
 	// 写入文件信息
-	data, _ := json.Marshal(map[string]interface{}{
+	data, marshalErr := json.Marshal(map[string]interface{}{
 		"config":      cfgGlb,
 		"version":     VERSION.String(),
 		"versionCode": VERSION_CODE,
 	})
-
-	h := &zip.FileHeader{Name: "backup_info.json", Method: zip.Deflate, Flags: 0x800}
-	fileWriter, _ := writer.CreateHeader(h)
-	_, _ = fileWriter.Write(data)
+	if marshalErr != nil {
+		recordBackupError(nil, "backup_info.json", marshalErr)
+	} else {
+		h := &zip.FileHeader{Name: "backup_info.json", Method: zip.Deflate, Flags: 0x800}
+		fileWriter, headerErr := writer.CreateHeader(h)
+		if headerErr != nil {
+			recordBackupError(nil, "backup_info.json", headerErr)
+		} else if n, writeErr := fileWriter.Write(data); writeErr != nil {
+			recordBackupError(nil, "backup_info.json", writeErr)
+		} else if n != len(data) {
+			recordBackupError(nil, "backup_info.json", io.ErrShortWrite)
+		}
+	}
+	writerErr := writer.Close()
+	syncErr := fzip.Sync()
+	fileCloseErr := fzip.Close()
+	archiveClosed = true
+	recordBackupError(nil, bakFn, errors.Join(writerErr, syncErr, fileCloseErr))
+	if err := errors.Join(backupErrors...); err != nil {
+		return "", err
+	}
 
 	return fzip.Name(), nil
 }

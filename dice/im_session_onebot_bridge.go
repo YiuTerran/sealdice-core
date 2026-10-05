@@ -2,6 +2,7 @@ package dice
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,11 +18,11 @@ import (
 
 func verifyOnebotBridgeBackup(filename string, diceDataDir string) error {
 	if filename == "" {
-		return fmt.Errorf("invalid backup filename")
+		return errors.New("invalid backup filename")
 	}
 	cleanName := filepath.Clean(filename)
 	if filepath.Dir(cleanName) != "." && filepath.Dir(cleanName) != filepath.Clean(BackupDir) {
-		return fmt.Errorf("invalid backup location")
+		return errors.New("invalid backup location")
 	}
 	filename = filepath.Base(cleanName)
 	file, err := os.Open(filepath.Join(BackupDir, filename))
@@ -38,7 +39,7 @@ func verifyOnebotBridgeBackup(filename string, diceDataDir string) error {
 		return err
 	}
 	if len(archive.File) == 0 {
-		return fmt.Errorf("backup archive is empty")
+		return errors.New("backup archive is empty")
 	}
 	required := map[string]bool{
 		"backup_info.json": false,
@@ -359,7 +360,7 @@ func onebotBridgeCardCountAllowed(cmdArgs *CmdArgs) bool {
 	if _, err := fmt.Sscanf(cmdArgs.Args[0], "%d", &count); err != nil || count < 1 || count > 10 {
 		return false
 	}
-	return fmt.Sprintf("%d", count) == cmdArgs.Args[0]
+	return strconv.Itoa(count) == cmdArgs.Args[0]
 }
 
 func onebotBridgeInputAllowed(text string) bool {
