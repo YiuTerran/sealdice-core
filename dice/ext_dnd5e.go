@@ -964,6 +964,9 @@ func RegisterBuiltinExtDnd5e(self *Dice) {
 					summary = "没有设置过法术位"
 				}
 				ReplyToSender(mctx, msg, fmt.Sprintf(`%s的法术位状况: %s`, getPlayerNameTempFunc(mctx), summary))
+				if ctx.LLMBridgeRequest != nil {
+					return CmdExecuteResult{Matched: true, Solved: true}
+				}
 			case "help":
 				return CmdExecuteResult{Matched: true, Solved: true, ShowHelp: true}
 			default:

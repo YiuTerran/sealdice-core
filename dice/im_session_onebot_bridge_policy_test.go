@@ -146,6 +146,55 @@ func TestOnebotBridgeSetCommandExecuteNewLifecycle(t *testing.T) {
 	}
 }
 
+func TestOnebotBridgeSpellSlotQueryCompletesExecuteNew(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	if err := d.DBOperator.GetDataDB(constant.WRITE).AutoMigrate(&model.GroupPlayerInfoBase{}, &model.AttributesItemModel{}); err != nil {
+		t.Fatal(err)
+	}
+	groupID := "QQ-Group:22102"
+	setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}
+	group := SetBotOnAtGroup(setupCtx, groupID)
+	group.System = "dnd5e"
+	dndExt := d.ExtFind("dnd5e", false)
+	if dndExt == nil {
+		t.Fatal("DND5E extension is unavailable")
+	}
+	group.SetActivatedExtList([]*ExtInfo{dndExt}, d)
+
+	em := &onebotBridgeCaptureEmitter{completeCh: make(chan onebotBridgeCompleteParams, 1)}
+	pa := &PlatformAdapterOnebot{EndPoint: ep, LLMBridgeEnabled: true, logger: d.Logger}
+	ep.Adapter = pa
+	ep.Session = d.ImSession
+	const sourceID int64 = 701
+	const userID int64 = 22101
+	const groupNumber int64 = 22102
+	_, tracker := newOnebotBridgeTestTracker(t, pa, em, "group", sourceID, userID, groupNumber, "spell-slot-query")
+	msg := newGroupMsg(groupID, "QQ:22101", ".ss")
+	msg.RawID = sourceID
+	msg.LLMBridgeRequest = tracker
+
+	d.ImSession.ExecuteNew(ep, msg)
+	// Mirror the incoming OneBot event's deferred completion around ExecuteNew.
+	tracker.finishTask()
+	select {
+	case completion := <-em.completeCh:
+		if completion.Status != "ok" || completion.OutputCount == 0 {
+			tracker.mu.Lock()
+			failureStage := tracker.failureStage
+			tracker.mu.Unlock()
+			t.Fatalf(".ss query completion = %#v, want ok with a reply (stage=%s)", completion, failureStage)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal(".ss query did not complete through the bridge tracker")
+	}
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	if len(em.sends) != 1 || em.sends[0].audience != "group" || em.sends[0].targetID != groupNumber {
+		t.Fatalf(".ss bridge sends = %#v, want one group reply", em.sends)
+	}
+}
+
 func TestOnebotBridgeMasterACLIsBoundedToConnection(t *testing.T) {
 	const connectionID = "master-acl-connection"
 	userID := onebotBridgeMasterIDMin + 1
