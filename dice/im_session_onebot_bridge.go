@@ -221,7 +221,7 @@ func onebotBridgePrivateQueryContext(ctx *MsgContext, msg *Message) (*GroupInfo,
 		group.DefaultHelpGroup = source.DefaultHelpGroup
 		group.ShowGroupWelcome = source.ShowGroupWelcome
 		group.GroupWelcomeMessage = source.GroupWelcomeMessage
-		group.extInitMu.Lock()
+		source.extInitMu.Lock()
 		for key := range source.InactivatedExtSet {
 			group.InactivatedExtSet[key] = struct{}{}
 		}

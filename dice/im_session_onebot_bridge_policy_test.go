@@ -265,6 +265,58 @@ func TestOnebotBridgeReadOnlyQueriesDoNotPersistPrivateGroupOrSwitchRules(t *tes
 	}
 }
 
+func TestOnebotBridgePrivateQueryContextCopiesExistingPrivateGroup(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	if err := d.DBOperator.GetDataDB(constant.WRITE).AutoMigrate(&model.GroupPlayerInfoBase{}); err != nil {
+		t.Fatal(err)
+	}
+
+	msg := newPrivateMsg("QQ:8999999999999997", ".userid")
+	groupID := "PG-" + msg.Sender.UserID
+	source := &GroupInfo{
+		GroupID:           groupID,
+		System:            "dnd5e",
+		InactivatedExtSet: StringSet{"disabled-extension": {}},
+		ExtAppliedTime:    1,
+	}
+	source.activatedExtList = []*ExtInfo{{Name: "unavailable-extension"}}
+	// Simulate a PG group created by an earlier private command such as .r or
+	// .master backup; subsequent queries copy its extension state.
+	d.ImSession.ServiceAtNew.Store(groupID, source)
+
+	ctx := &MsgContext{
+		Dice:        d,
+		EndPoint:    ep,
+		Session:     d.ImSession,
+		MessageType: "private",
+		IsPrivate:   true,
+	}
+	group, player := onebotBridgePrivateQueryContext(ctx, msg)
+	if group == nil || player == nil {
+		t.Fatalf("private query context = group %#v, player %#v", group, player)
+	}
+	if group.System != source.System || !group.IsExtInactivated("disabled-extension") {
+		t.Fatalf("private query did not copy existing group settings: %#v", group)
+	}
+	if _, dirty := d.DirtyGroups.Load(groupID); dirty {
+		t.Fatal("private query marked the existing PG group dirty")
+	}
+	foundExistingExtension := false
+	for _, extension := range group.activatedExtList {
+		if extension == source.activatedExtList[0] {
+			foundExistingExtension = true
+			break
+		}
+	}
+	if !foundExistingExtension {
+		t.Fatalf("private query did not copy existing extension state: %#v", group.activatedExtList)
+	}
+	if len(source.activatedExtList) != 1 || source.activatedExtList[0].Name != "unavailable-extension" {
+		t.Fatalf("private query mutated source extension state: %#v", source.activatedExtList)
+	}
+}
+
 func TestOnebotBridgeBanMutationPersistsOnlyTargetAndRollsBackOnFailure(t *testing.T) {
 	d, _, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
