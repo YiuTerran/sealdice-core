@@ -337,6 +337,53 @@ func TestOnebotBridgeMalformedEventDoesNotLogPayload(t *testing.T) {
 	}
 }
 
+func TestOnebotBridgeIgnoresGensokyoMetaEventsWithoutWarning(t *testing.T) {
+	core, observed := observer.New(zapcore.WarnLevel)
+	pa := &PlatformAdapterOnebot{LLMBridgeEnabled: true, logger: zap.New(core).Sugar()}
+	// A nil Kws makes any event that reaches dispatch panic. These control
+	// events must be dropped at the bridge gate before dispatching to handlers.
+	for i := 0; i < 3; i++ {
+		for _, metaType := range []string{"heartbeat", "lifecycle"} {
+			raw := []byte(`{"post_type":"meta_event","meta_event_type":"` + metaType + `","private":"heartbeat-lifecycle-sentinel"}`)
+			func() {
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						t.Fatalf("meta_event/%s reached event dispatch: %v", metaType, recovered)
+					}
+				}()
+				pa.serveOnebotEvent(&socketio.EventPayload{Data: raw})
+			}()
+		}
+	}
+	if logs := observed.All(); len(logs) != 0 {
+		t.Fatalf("heartbeat/lifecycle emitted bridge warnings: %v", logs)
+	}
+}
+
+func TestOnebotBridgeStillWarnsForOtherNonMessageEvents(t *testing.T) {
+	core, observed := observer.New(zapcore.WarnLevel)
+	pa := &PlatformAdapterOnebot{LLMBridgeEnabled: true, logger: zap.New(core).Sugar()}
+	for _, raw := range []string{
+		`{"post_type":"meta_event","meta_event_type":"unknown","private":"private-sentinel"}`,
+		`{"post_type":"notice","private":"private-sentinel"}`,
+		`{"post_type":"request","private":"private-sentinel"}`,
+	} {
+		pa.serveOnebotEvent(&socketio.EventPayload{Data: []byte(raw)})
+	}
+	logs := observed.All()
+	if len(logs) != 3 {
+		t.Fatalf("non-message bridge events produced %d warnings, want 3: %v", len(logs), logs)
+	}
+	for _, entry := range logs {
+		if entry.Message != "OneBot LLM bridge event rejected: only message events are accepted" {
+			t.Fatalf("unexpected non-message warning: %q", entry.Message)
+		}
+		if strings.Contains(entry.Message, "private-sentinel") {
+			t.Fatalf("private event payload leaked to log: %q", entry.Message)
+		}
+	}
+}
+
 func TestOnebotBridgeSolvedNoOutputIsOkAndLateTaskCannotRestart(t *testing.T) {
 	p := &PlatformAdapterOnebot{LLMBridgeEnabled: true, logger: zap.NewNop().Sugar()}
 	em := &onebotBridgeCaptureEmitter{completeCh: make(chan onebotBridgeCompleteParams, 1)}

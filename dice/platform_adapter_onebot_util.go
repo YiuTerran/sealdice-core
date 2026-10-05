@@ -50,6 +50,12 @@ func (p *PlatformAdapterOnebot) serveOnebotEvent(ep *evsocket.EventPayload) {
 	if p.LLMBridgeEnabled {
 		postType := resp.Get("post_type").String()
 		if postType != "" && postType != "message" {
+			if postType == "meta_event" {
+				eventType := resp.Get("meta_event_type").String()
+				if eventType == "heartbeat" || eventType == "lifecycle" {
+					return
+				}
+			}
 			p.logger.Warn("OneBot LLM bridge event rejected: only message events are accepted")
 			return
 		}
