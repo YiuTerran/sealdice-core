@@ -49,6 +49,10 @@ func (p *PlatformAdapterOnebot) serveOnebotEvent(ep *evsocket.EventPayload) {
 	resp := gjson.ParseBytes(ep.Data)
 	if p.LLMBridgeEnabled {
 		postType := resp.Get("post_type").String()
+		if postType == onebotLLMBridgeLogEventPostType {
+			p.onOnebotMessageEvent(ep)
+			return
+		}
 		if postType != "" && postType != "message" {
 			if postType == "meta_event" {
 				eventType := resp.Get("meta_event_type").String()
@@ -117,10 +121,12 @@ func (p *PlatformAdapterOnebot) onOnebotMessageEvent(ep *evsocket.EventPayload) 
 			return
 		}
 		// Registration's action echo may still be in flight. Process the event on
-		// a separate goroutine so waiting here cannot block the socket reader that
-		// must deliver that echo.
+		// a per-connection FIFO worker so waiting here cannot block the socket
+		// reader that must deliver action echoes and controls retain arrival order.
 		data := append([]byte(nil), ep.Data...)
-		go p.processOnebotMessageEvent(data, conn)
+		if !conn.enqueueEvent(data) {
+			p.logger.Warn("OneBot LLM bridge message rejected: connection dispatch is unavailable")
+		}
 		return
 	}
 	p.processOnebotMessageEvent(ep.Data, nil)
@@ -134,6 +140,10 @@ func (p *PlatformAdapterOnebot) processOnebotMessageEvent(raw []byte, conn *oneb
 	if p.LLMBridgeEnabled && !gjson.ValidBytes(raw) {
 		p.completeMalformedBridgeMessage(conn, raw)
 		p.logger.Warn("OneBot LLM bridge message rejected: malformed event")
+		return
+	}
+	if conn != nil && gjson.ParseBytes(raw).Get("post_type").String() == onebotLLMBridgeLogEventPostType {
+		p.processOnebotBridgeLogEvent(raw, conn)
 		return
 	}
 	parseLogger := p.logger
@@ -188,6 +198,16 @@ func (p *PlatformAdapterOnebot) processOnebotMessageEvent(raw []byte, conn *oneb
 			}
 			session.ExecuteNew(p.EndPoint, msg)
 		}()
+		if tracker.done != nil {
+			var connDone <-chan struct{}
+			if conn.ctx != nil {
+				connDone = conn.ctx.Done()
+			}
+			select {
+			case <-tracker.done:
+			case <-connDone:
+			}
+		}
 		return
 	}
 	session := p.EndPoint.Session

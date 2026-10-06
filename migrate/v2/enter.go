@@ -11,6 +11,7 @@ import (
 	v151 "sealdice-core/migrate/v2/v151"
 	v160 "sealdice-core/migrate/v2/v160"
 	v161 "sealdice-core/migrate/v2/v161"
+	v162 "sealdice-core/migrate/v2/v162"
 	"sealdice-core/utils/constant"
 	operator "sealdice-core/utils/dboperator/engine"
 	upgrade "sealdice-core/utils/upgrader"
@@ -44,6 +45,8 @@ func InitUpgrader(operator operator.DatabaseOperator) error {
 	// v161注册
 	mgr.Register(v161.V161NoticeIDsMigration)
 	mgr.Register(v161.V161LogUpdatedAtRepairMigration)
+	// v162 registers the durable OneBot bridge capture ledger.
+	mgr.Register(v162.V162OnebotBridgeLogEventsMigration)
 	err := mgr.ApplyAll()
 	if err != nil {
 		return err

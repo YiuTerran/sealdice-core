@@ -161,12 +161,22 @@ func TestOnebotBridgeRuntimeRegistersOnlyReviewedNativeExtensions(t *testing.T) 
 		GameSystemMap:        new(SyncMap[string, *GameSystemTemplate]),
 	}
 	dice.registerBuiltinExtForRuntime()
-	if len(dice.ExtList) != 3 || dice.ExtList[0].Name != "coc7" || dice.ExtList[1].Name != "dnd5e" || dice.ExtList[2].Name != "fun" {
-		t.Fatalf("bridge extension registry = %#v, want coc7, dnd5e, and reviewed fun subset", dice.ExtList)
+	if len(dice.ExtList) != 4 || dice.ExtList[0].Name != "coc7" || dice.ExtList[1].Name != "dnd5e" || dice.ExtList[2].Name != "fun" || dice.ExtList[3].Name != "bridge-log" {
+		t.Fatalf("bridge extension registry = %#v, want coc7, dnd5e, reviewed fun, and parser-only log", dice.ExtList)
+	}
+	parserLog := dice.ExtList[3]
+	if parserLog.AutoActive || parserLog.GetCmdMap()["log"] == nil || parserLog.GetCmdMap()["log"].Solve != nil ||
+		parserLog.OnCommandReceived != nil || parserLog.OnMessageReceived != nil || parserLog.OnMessageSend != nil {
+		t.Fatalf("bridge log parser must contain no handlers or hooks: %#v", parserLog)
 	}
 	dice.applyOnebotBridgeIsolation()
-	if len(dice.Config.ExtDefaultSettings) != 3 {
-		t.Fatalf("bridge default extension settings = %#v, want exactly three reviewed extensions", dice.Config.ExtDefaultSettings)
+	if len(dice.Config.ExtDefaultSettings) != 4 {
+		t.Fatalf("bridge default extension settings = %#v, want three active extensions and inactive bridge-log", dice.Config.ExtDefaultSettings)
+	}
+	for _, setting := range dice.Config.ExtDefaultSettings {
+		if setting.Name == "bridge-log" && setting.AutoActive {
+			t.Fatal("bridge-log parser extension must stay inactive in groups")
+		}
 	}
 	fun, _ := dice.ExtRegistry.Load("fun")
 	if fun == nil || fun.OnCommandReceived != nil || fun.OnLoad != nil || fun.OnPoke != nil {

@@ -4,7 +4,8 @@
     ".ww 4a10", ".dx 5c10", ".ek 潜行", ".rsr 5", ".coc 10", ".dndx 10", ".dnd", ".ti", ".li", ".userid",
     ".find 火球术 --page=2 --num=3", ".查询 --rand", ".set info", ".setcoc", ".setcoc details", ".ss", ".buff",
     ".ds stat", ".死亡豁免 stat", ".init", ".init list", ".jrrp", ".咕咕", ".ping", ".master list", ".master backup",
-    ".ban list", ".ban query QQ:8999999999999999"
+    ".ban list", ".ban query QQ:8999999999999999", ".log list", ".log new session",
+    ".log on session", ".log stat", ".log get", ".log export --format=txt", ".log get --format=txt"
   ],
   "denied": [
     ".rh 1d1", ".rah 侦查", ".rxh 1d1", ".rhx 1d1", ".drlh", ".ww set clr", ".ss set 3",
@@ -12,6 +13,8 @@
     ".coc 11", ".dnd 0", ".r 11#1d1", ".master add me", ".master reboot", ".ban del QQ:8999999999999999",
     ".rsr", ".rsr 5 extra", ".r 1d1 --anything", ".find help", ".find --page=1", ".dxh 5", ".wh 3", ".wwh 3",
     ".ban rm QQ:8999999999999999 extra", ".ban add QQ:8999999999999999 two words",
-    ".st hp-1 @other", ".log list", ".send x", ".rav 力量", ".text {1d1}", ".alias a b", ".r 1d1\n.st 力量0"
+    ".st hp-1 @other", ".log new one two", ".log del", ".log end extra", ".log get --all",
+    ".log export user@example.com", ".log export --format=md", ".log list 123", ".log masterget 123 x",
+    ".send x", ".rav 力量", ".text {1d1}", ".alias a b", ".r 1d1\n.st 力量0"
   ]
 }

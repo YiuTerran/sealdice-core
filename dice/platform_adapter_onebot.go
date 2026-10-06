@@ -575,9 +575,18 @@ func (p *PlatformAdapterOnebot) isServer() bool {
 // onConnected 连接成功的回调函数
 func (p *PlatformAdapterOnebot) onConnected(kws *socketio.WebsocketWrapper) {
 	// 连接成功，获取当前登录状态
+	connectionContext := p.ctx
+	var connectionCancel context.CancelFunc
+	if p.LLMBridgeEnabled {
+		if connectionContext == nil {
+			connectionContext = context.Background()
+		}
+		connectionContext, connectionCancel = context.WithCancel(connectionContext)
+	}
 	conn := &onebotBridgeConnection{
 		emitter:      emitter.NewEVEmitter(kws),
-		ctx:          p.ctx,
+		ctx:          connectionContext,
+		cancel:       connectionCancel,
 		registerDone: make(chan struct{}),
 	}
 	p.bridgeConnectionMu.Lock()
@@ -586,6 +595,9 @@ func (p *PlatformAdapterOnebot) onConnected(kws *socketio.WebsocketWrapper) {
 	}
 	p.bridgeConnections[kws] = conn
 	p.bridgeConnectionMu.Unlock()
+	if p.LLMBridgeEnabled {
+		conn.startDispatch(func(raw []byte) { p.processOnebotMessageEvent(raw, conn) })
+	}
 	if !p.LLMBridgeEnabled {
 		p.sendEmitter = conn.emitter
 	}

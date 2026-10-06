@@ -9,6 +9,7 @@ import (
 	"github.com/pilagod/gorm-cursor-paginator/v2/paginator"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"sealdice-core/logger"
 	"sealdice-core/model"
@@ -20,6 +21,242 @@ type LogOne struct {
 	// Version int           `json:"version,omitempty"`
 	Items []model.LogOneItem `json:"items"`
 	Info  model.LogInfo      `json:"info"`
+}
+
+type LogCaptureAppendResult struct {
+	Duplicate bool
+	Recorded  bool
+}
+
+var ErrBridgeLogStateNotFound = errors.New("bridge log state does not exist")
+
+func OnebotBridgeLogStateGet(operator engine2.DatabaseOperator, groupID string) (model.OnebotBridgeLogState, error) {
+	var state model.OnebotBridgeLogState
+	err := operator.GetLogDB(constant.READ).Where("group_id = ?", groupID).Take(&state).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return model.OnebotBridgeLogState{}, ErrBridgeLogStateNotFound
+	}
+	return state, err
+}
+
+func OnebotBridgeLogStateSave(operator engine2.DatabaseOperator, state model.OnebotBridgeLogState) error {
+	if operator == nil || state.GroupID == "" {
+		return errors.New("invalid bridge log state")
+	}
+	if state.LogID == 0 || state.Name == "" {
+		state.LogID = 0
+		state.Name = ""
+		state.On = false
+	}
+	state.UpdatedAt = time.Now().Unix()
+	db := operator.GetLogDB(constant.WRITE)
+	return db.Transaction(func(tx *gorm.DB) error {
+		if state.On {
+			if state.LogID == 0 || state.Name == "" {
+				return errors.New("active bridge log requires a log id and name")
+			}
+			info, err := getLogInfoByID(tx, state.LogID)
+			if err != nil {
+				return err
+			}
+			if info.GroupID != state.GroupID || info.Name != state.Name {
+				return errors.New("active bridge log does not match its group and name")
+			}
+		} else if state.LogID == 0 || state.Name == "" {
+			state.LogID = 0
+			state.Name = ""
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "group_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"log_id", "name", "is_on", "updated_at"}),
+		}).Create(&state).Error
+	})
+}
+
+// OnebotBridgeLogNew creates or reuses a native log and switches the durable
+// bridge state to recording in one log-DB transaction.
+func OnebotBridgeLogNew(operator engine2.DatabaseOperator, groupID, name string) (model.OnebotBridgeLogState, error) {
+	if operator == nil || groupID == "" || name == "" {
+		return model.OnebotBridgeLogState{}, errors.New("invalid bridge log name")
+	}
+	db := operator.GetLogDB(constant.WRITE)
+	state := model.OnebotBridgeLogState{GroupID: groupID, Name: name, On: true, UpdatedAt: time.Now().Unix()}
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		state.LogID, err = getIDByGroupIDAndName(tx, groupID, name)
+		if errors.Is(err, ErrLogNotFound) {
+			state.LogID, err = createLog(tx, groupID, name, state.UpdatedAt)
+		}
+		if err != nil {
+			return err
+		}
+		return tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "group_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"log_id", "name", "is_on", "updated_at"}),
+		}).Create(&state).Error
+	})
+	return state, err
+}
+
+func OnebotBridgeLogActiveStates(operator engine2.DatabaseOperator) ([]model.OnebotBridgeLogState, error) {
+	var states []model.OnebotBridgeLogState
+	err := operator.GetLogDB(constant.READ).Where("is_on = ? AND log_id > 0", true).Order("group_id ASC").Find(&states).Error
+	return states, err
+}
+
+// LogCaptureAppend persists the event id and, when recording is enabled,
+// appends its item in one transaction. A duplicate is acknowledged without a
+// second log item. The event ledger also remembers events discarded while off.
+func LogCaptureAppend(operator engine2.DatabaseOperator, eventID, groupID, kind string, item *model.LogOneItem) (LogCaptureAppendResult, model.OnebotBridgeLogState, error) {
+	if operator == nil || eventID == "" || groupID == "" || kind == "" {
+		return LogCaptureAppendResult{}, model.OnebotBridgeLogState{}, errors.New("invalid OneBot bridge log event")
+	}
+
+	db := operator.GetLogDB(constant.WRITE)
+	result := LogCaptureAppendResult{}
+	var state model.OnebotBridgeLogState
+	err := db.Transaction(func(tx *gorm.DB) error {
+		event := model.OnebotBridgeLogEvent{
+			EventID:   eventID,
+			GroupID:   groupID,
+			Kind:      kind,
+			CreatedAt: time.Now().Unix(),
+		}
+		created := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&event)
+		if created.Error != nil {
+			return created.Error
+		}
+		if created.RowsAffected == 0 {
+			result.Duplicate = true
+		}
+		if err := tx.Where("group_id = ?", groupID).Take(&state).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return err
+		}
+		if result.Duplicate || !state.On {
+			return nil
+		}
+		if state.LogID == 0 || item == nil {
+			return errors.New("active bridge log has invalid state")
+		}
+
+		logInfo, err := getLogInfoByID(tx, state.LogID)
+		if err != nil {
+			return err
+		}
+		if logInfo.GroupID != groupID {
+			return fmt.Errorf("OneBot bridge log %d does not belong to group %s", state.LogID, groupID)
+		}
+		event.LogID = state.LogID
+		event.Recorded = true
+		if err := tx.Model(&event).Updates(map[string]interface{}{"log_id": state.LogID, "recorded": true}).Error; err != nil {
+			return err
+		}
+
+		at := item.Time
+		if at <= 0 {
+			at = time.Now().Unix()
+		}
+		entry := model.LogOneItem{
+			LogID:       state.LogID,
+			GroupID:     groupID,
+			Nickname:    item.Nickname,
+			IMUserID:    item.IMUserID,
+			Time:        at,
+			Message:     item.Message,
+			IsDice:      item.IsDice,
+			CommandID:   item.CommandID,
+			CommandInfo: item.CommandInfo,
+			RawMsgID:    item.RawMsgID,
+			UniformID:   item.UniformID,
+		}
+		if err := tx.Create(&entry).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.LogInfo{}).Where("id = ?", state.LogID).Updates(map[string]interface{}{
+			"updated_at": at,
+			"size":       gorm.Expr("COALESCE(size, 0) + ?", 1),
+		}).Error; err != nil {
+			return err
+		}
+		result.Recorded = true
+		return nil
+	})
+	if err != nil {
+		return LogCaptureAppendResult{}, model.OnebotBridgeLogState{}, err
+	}
+	return result, state, nil
+}
+
+func LogCaptureGapCount(operator engine2.DatabaseOperator, groupID string, logID uint64) (int64, error) {
+	if operator == nil || groupID == "" || logID == 0 {
+		return 0, errors.New("invalid OneBot bridge log gap query")
+	}
+	var count int64
+	err := operator.GetLogDB(constant.READ).Model(&model.OnebotBridgeLogEvent{}).
+		Where("group_id = ? AND log_id = ? AND kind = ? AND recorded = ?", groupID, logID, "gap", true).
+		Count(&count).Error
+	return count, err
+}
+
+func LogCaptureGapCountByName(operator engine2.DatabaseOperator, groupID, name string) (int64, error) {
+	if operator == nil || groupID == "" || name == "" {
+		return 0, errors.New("invalid OneBot bridge log gap query")
+	}
+	db := operator.GetLogDB(constant.READ)
+	logID, err := getIDByGroupIDAndName(db, groupID, name)
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	err = db.Model(&model.OnebotBridgeLogEvent{}).
+		Where("group_id = ? AND log_id = ? AND kind = ? AND recorded = ?", groupID, logID, "gap", true).
+		Count(&count).Error
+	return count, err
+}
+
+// LogCaptureSnapshotWalk reads a fixed log_items ID cutoff in bounded pages.
+// The read transaction remains open while visit consumes each page, so later
+// appends and concurrent log deletion cannot produce a mixed export snapshot.
+func LogCaptureSnapshotWalk(operator engine2.DatabaseOperator, groupID, name string, batchSize int, visit func([]*model.LogOneItem) error) (uint64, error) {
+	if operator == nil || groupID == "" || name == "" || batchSize < 1 || batchSize > 256 || visit == nil {
+		return 0, errors.New("invalid OneBot bridge log snapshot request")
+	}
+	db := operator.GetLogDB(constant.READ)
+	var cutoff uint64
+	err := db.Transaction(func(tx *gorm.DB) error {
+		logID, err := getIDByGroupIDAndName(tx, groupID, name)
+		if err != nil {
+			return err
+		}
+		if err := tx.Model(&model.LogOneItem{}).Where("log_id = ?", logID).Select("COALESCE(MAX(id), 0)").Scan(&cutoff).Error; err != nil {
+			return err
+		}
+		var afterID uint64
+		for afterID < cutoff {
+			var page []*model.LogOneItem
+			if err := tx.Model(&model.LogOneItem{}).
+				Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
+				Where("log_id = ? AND id > ? AND id <= ?", logID, afterID, cutoff).
+				Order("id ASC").Limit(batchSize).Find(&page).Error; err != nil {
+				return err
+			}
+			if len(page) == 0 {
+				break
+			}
+			if err := visit(page); err != nil {
+				return err
+			}
+			afterID = page[len(page)-1].ID
+			if len(page) < batchSize {
+				break
+			}
+		}
+		return nil
+	})
+	return cutoff, err
 }
 
 var ErrLogNotFound = errors.New("日志不存在")

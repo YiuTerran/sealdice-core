@@ -16,6 +16,7 @@ import (
 	v151 "sealdice-core/migrate/v2/v151"
 	v160 "sealdice-core/migrate/v2/v160"
 	v161 "sealdice-core/migrate/v2/v161"
+	v162 "sealdice-core/migrate/v2/v162"
 	"sealdice-core/utils/constant"
 	engine "sealdice-core/utils/dboperator/engine"
 	"sealdice-core/utils/dboperator/engine/sqlite"
@@ -89,6 +90,7 @@ func NewTestManager(t *testing.T, op engine.DatabaseOperator) *upgrade.Manager {
 	mgr.Register(v160.V160LogSizeRepairMigration)
 	mgr.Register(v161.V161NoticeIDsMigration)
 	mgr.Register(v161.V161LogUpdatedAtRepairMigration)
+	mgr.Register(v162.V162OnebotBridgeLogEventsMigration)
 	return mgr
 }
 

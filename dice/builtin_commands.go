@@ -1459,7 +1459,11 @@ func (d *Dice) registerCoreCommands() {
 				var textBuilder strings.Builder
 				if tracker := ctx.LLMBridgeRequest; tracker != nil && tracker.connection != nil {
 					for _, id := range tracker.connection.authorizedMasterIDs(tracker.connectionID) {
-						fmt.Fprintf(&textBuilder, "- QQ:%d\n", id)
+						if identity, ok := tracker.connection.masterUserKey(tracker.connectionID, id); ok {
+							fmt.Fprintf(&textBuilder, "- %s\n  海豹内部虚拟用户 ID：QQ:%d\n", identity, id)
+						} else {
+							fmt.Fprintf(&textBuilder, "- 海豹内部虚拟用户 ID：QQ:%d\n", id)
+						}
 					}
 				} else {
 					for _, i := range ctx.Dice.DiceMasters {
@@ -2190,6 +2194,18 @@ func (d *Dice) registerCoreCommands() {
 			text := fmt.Sprintf("个人账号ID为 %s", ctx.Player.UserID)
 			if !ctx.IsPrivate {
 				text += fmt.Sprintf("\n当前群组ID为 %s", ctx.Group.GroupID)
+			}
+			if tracker := ctx.LLMBridgeRequest; tracker != nil {
+				userLabel := fmt.Sprintf("配置身份未提供\n海豹内部虚拟用户 ID：QQ:%d", tracker.userID)
+				if tracker.connection != nil {
+					if identity, ok := tracker.connection.masterUserKey(tracker.connectionID, tracker.userID); ok {
+						userLabel = fmt.Sprintf("当前配置身份：%s\n海豹内部虚拟用户 ID：QQ:%d", identity, tracker.userID)
+					}
+				}
+				text = userLabel
+				if tracker.audience == "group" {
+					text += fmt.Sprintf("\n海豹内部虚拟群 ID：QQ-Group:%d", tracker.groupID)
+				}
 			}
 
 			ReplyToSender(ctx, msg, text)

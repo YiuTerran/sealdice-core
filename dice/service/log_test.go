@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -145,7 +146,7 @@ func newLogInfoTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("open sqlite db: %v", err)
 	}
-	if migrateErr := db.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}); migrateErr != nil {
+	if migrateErr := db.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}, &model.OnebotBridgeLogEvent{}, &model.OnebotBridgeLogState{}); migrateErr != nil {
 		t.Fatalf("migrate log tables: %v", migrateErr)
 	}
 	sqlDB, dbErr := db.DB()
@@ -156,6 +157,114 @@ func newLogInfoTestDB(t *testing.T) *gorm.DB {
 		_ = sqlDB.Close()
 	})
 	return db
+}
+
+func TestOnebotBridgeLogCaptureStateDedupAndGroupIsolation(t *testing.T) {
+	db := newLogInfoTestDB(t)
+	op := &logInfoTestOperator{db: db, dbType: constant.SQLITE}
+	groupID := "QQ-Group:8000000000000001"
+	otherGroupID := "QQ-Group:8000000000000002"
+
+	if _, err := service.OnebotBridgeLogStateGet(op, groupID); !errors.Is(err, service.ErrBridgeLogStateNotFound) {
+		t.Fatalf("new bridge state should be absent/off by default, got err=%v", err)
+	}
+	if _, err := service.OnebotBridgeLogActiveStates(op); err != nil {
+		t.Fatal(err)
+	}
+	state, err := service.OnebotBridgeLogNew(op, groupID, "session")
+	if err != nil {
+		t.Fatalf("OnebotBridgeLogNew: %v", err)
+	}
+	if !state.On || state.LogID == 0 || state.GroupID != groupID {
+		t.Fatalf("unexpected newly active state: %#v", state)
+	}
+	first := &model.LogOneItem{Nickname: "Alice", IMUserID: "8000000000000003", UniformID: "OneBotBridge:QQ:8000000000000003", Time: 1710000001, Message: "first", RawMsgID: "event-one"}
+	got, _, err := service.LogCaptureAppend(op, "event-one", groupID, "message", first)
+	if err != nil || !got.Recorded || got.Duplicate {
+		t.Fatalf("first capture = %#v, err=%v", got, err)
+	}
+
+	state.On = false
+	if saveErr := service.OnebotBridgeLogStateSave(op, state); saveErr != nil {
+		t.Fatal(saveErr)
+	}
+	discarded := &model.LogOneItem{Nickname: "Alice", IMUserID: "8000000000000003", Time: 1710000002, Message: "must stay discarded"}
+	got, _, err = service.LogCaptureAppend(op, "event-off", groupID, "message", discarded)
+	if err != nil || got.Recorded || got.Duplicate {
+		t.Fatalf("off capture = %#v, err=%v", got, err)
+	}
+	state.On = true
+	if saveErr := service.OnebotBridgeLogStateSave(op, state); saveErr != nil {
+		t.Fatal(saveErr)
+	}
+	got, _, err = service.LogCaptureAppend(op, "event-off", groupID, "message", discarded)
+	if err != nil || !got.Duplicate || got.Recorded {
+		t.Fatalf("replayed off event = %#v, err=%v", got, err)
+	}
+	got, _, err = service.LogCaptureAppend(op, "event-one", groupID, "message", &model.LogOneItem{Time: 1710000099, Message: "duplicate body"})
+	if err != nil || !got.Duplicate || got.Recorded {
+		t.Fatalf("duplicate capture = %#v, err=%v", got, err)
+	}
+
+	gap := &model.LogOneItem{Nickname: "SeaDice记录系统", IMUserID: "system", UniformID: "OneBotBridge:system", Time: 1710000003, Message: "记录缺口：连接恢复期间可能漏记。", IsDice: true, CommandInfo: map[string]string{"bridgeCaptureKind": "gap"}}
+	got, _, err = service.LogCaptureAppend(op, "gap-event", groupID, "gap", gap)
+	if err != nil || !got.Recorded {
+		t.Fatalf("gap capture = %#v, err=%v", got, err)
+	}
+
+	items, err := service.LogGetAllLines(op, groupID, "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].Message != "first" || items[0].Time != 1710000001 {
+		t.Fatalf("captured rows changed or off event was imported: %#v", items)
+	}
+	if gotGaps, gapErr := service.LogCaptureGapCountByName(op, groupID, "session"); gapErr != nil || gotGaps != 1 {
+		t.Fatalf("gap count = %d, err=%v", gotGaps, gapErr)
+	}
+	if _, _, captureErr := service.LogCaptureAppend(op, "event-one", otherGroupID, "message", first); captureErr != nil {
+		t.Fatalf("same event id in another group must remain isolated: %v", captureErr)
+	}
+	otherItems, err := service.LogGetAllLines(op, otherGroupID, "session")
+	if err != nil || len(otherItems) != 0 {
+		t.Fatalf("event crossed group boundary: items=%#v err=%v", otherItems, err)
+	}
+}
+
+func TestOnebotBridgeLogSnapshotWalkUsesBoundedIDPages(t *testing.T) {
+	db := newLogInfoTestDB(t)
+	op := &logInfoTestOperator{db: db, dbType: constant.SQLITE}
+	groupID := "QQ-Group:8000000000000011"
+	if _, err := service.OnebotBridgeLogNew(op, groupID, "paged"); err != nil {
+		t.Fatal(err)
+	}
+	for index := range 7 {
+		item := &model.LogOneItem{Time: int64(1710000000 + index), Message: fmt.Sprintf("row-%d", index)}
+		if _, _, err := service.LogCaptureAppend(op, fmt.Sprintf("page-event-%d", index), groupID, "message", item); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pages := 0
+	rows := 0
+	cutoff, err := service.LogCaptureSnapshotWalk(op, groupID, "paged", 2, func(page []*model.LogOneItem) error {
+		pages++
+		if len(page) > 2 {
+			t.Fatalf("snapshot page exceeded requested bound: %d", len(page))
+		}
+		for _, row := range page {
+			if !strings.HasPrefix(row.Message, "row-") {
+				t.Fatalf("unexpected row order/content: %#v", row)
+			}
+			rows++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pages != 4 || rows != 7 || cutoff == 0 {
+		t.Fatalf("snapshot walked pages=%d rows=%d cutoff=%d", pages, rows, cutoff)
+	}
 }
 
 func newLogInfoMySQLTestOperator(t *testing.T) (*logInfoTestOperator, sqlmock.Sqlmock) {

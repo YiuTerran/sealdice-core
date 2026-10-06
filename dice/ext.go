@@ -138,10 +138,18 @@ func (d *Dice) registerBuiltinExtForRuntime() {
 		RegisterBuiltinExtCoc7(d)
 		RegisterBuiltinExtDnd5e(d)
 		registerBuiltinExtFunForBridge(d)
+		registerBuiltinExtLogForBridge(d)
 		d.RegisterBuiltinSystemTemplate()
 		return
 	}
 	d.RegisterBuiltinExt()
+}
+
+func registerBuiltinExtLogForBridge(d *Dice) {
+	d.RegisterExtension(&ExtInfo{
+		Name:   "bridge-log",
+		CmdMap: CmdMapCls{"log": {Name: "log"}},
+	})
 }
 
 func (d *Dice) RegisterBuiltinSystemTemplate() {

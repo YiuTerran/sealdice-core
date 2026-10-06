@@ -110,6 +110,37 @@ type LogInfo struct {
 	UploadTime int    `gorm:"column:upload_time" json:"-"` // 测试版特供
 }
 
+// OnebotBridgeLogEvent records the first handling result for a capture event.
+// Event IDs are persisted even when recording is off so a replay after a later
+// .log on cannot import an event that was already acknowledged as discarded.
+type OnebotBridgeLogEvent struct {
+	ID        uint64 `gorm:"primaryKey;autoIncrement;column:id"`
+	EventID   string `gorm:"column:event_id;size:220;uniqueIndex:idx_onebot_bridge_log_group_event,priority:2"`
+	GroupID   string `gorm:"column:group_id;uniqueIndex:idx_onebot_bridge_log_group_event,priority:1;index:idx_onebot_bridge_log_event_group_log"`
+	LogID     uint64 `gorm:"column:log_id;index:idx_onebot_bridge_log_event_group_log"`
+	Kind      string `gorm:"column:kind;size:16"`
+	Recorded  bool   `gorm:"column:recorded"`
+	CreatedAt int64  `gorm:"column:created_at"`
+}
+
+func (*OnebotBridgeLogEvent) TableName() string {
+	return "onebot_bridge_log_events"
+}
+
+// OnebotBridgeLogState is authoritative only for the optional isolated bridge
+// capture path. Ordinary OneBot logging continues to use GroupInfo.LogOn.
+type OnebotBridgeLogState struct {
+	GroupID   string `gorm:"primaryKey;column:group_id"`
+	LogID     uint64 `gorm:"column:log_id"`
+	Name      string `gorm:"column:name;size:255"`
+	On        bool   `gorm:"column:is_on"`
+	UpdatedAt int64  `gorm:"column:updated_at"`
+}
+
+func (*OnebotBridgeLogState) TableName() string {
+	return "onebot_bridge_log_states"
+}
+
 func (*LogInfo) TableName() string {
 	return "logs"
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,11 @@ type onebotBridgeCapturedCompletion struct {
 	params onebotBridgeCompleteParams
 }
 
+type onebotBridgeCapturedAction struct {
+	action string
+	params json.RawMessage
+}
+
 type onebotBridgeCaptureEmitter struct {
 	emitter.Emitter
 
@@ -41,7 +47,10 @@ type onebotBridgeCaptureEmitter struct {
 	sends         []onebotBridgeCapturedSend
 	completions   []onebotBridgeCapturedCompletion
 	registrations []onebotBridgeRegisterParams
+	actions       []onebotBridgeCapturedAction
 	sendErr       error
+	rawActionErr  error
+	rawActionName emitter.Action
 	sendStarted   chan struct{}
 	releaseSend   chan struct{}
 	completeCh    chan onebotBridgeCompleteParams
@@ -93,6 +102,21 @@ func (e *onebotBridgeCaptureEmitter) Raw(_ context.Context, action emitter.Actio
 		e.registrations = append(e.registrations, registration)
 		e.mu.Unlock()
 		return []byte(`{"status":"ok","retcode":0,"data":{"version":1,"connection_id":"registered-connection"}}`), nil
+	}
+	if action == onebotLLMBridgeLogAckAction || action == onebotLLMBridgeArtifactAction {
+		encoded, err := json.Marshal(params)
+		if err != nil {
+			return nil, err
+		}
+		e.mu.Lock()
+		e.actions = append(e.actions, onebotBridgeCapturedAction{action: action, params: append(json.RawMessage(nil), encoded...)})
+		rawErr := e.rawActionErr
+		rawErrName := e.rawActionName
+		e.mu.Unlock()
+		if rawErr != nil && (rawErrName == "" || rawErrName == action) {
+			return nil, fmt.Errorf("action failure params=%s cause=%s", encoded, rawErr.Error())
+		}
+		return []byte(`{"status":"ok","retcode":0,"data":{}}`), nil
 	}
 	if action != onebotLLMBridgeCompleteAction {
 		return []byte(`{"status":"ok","retcode":0,"data":{}}`), nil
@@ -234,6 +258,8 @@ func TestOnebotBridgeRegistrationRaceAndNativeCompletionAfterSend(t *testing.T) 
 	kws := &socketio.WebsocketWrapper{}
 	conn := &onebotBridgeConnection{emitter: em, ctx: context.Background(), registerDone: make(chan struct{})}
 	pa.bridgeConnections = map[*socketio.WebsocketWrapper]*onebotBridgeConnection{kws: conn}
+	conn.startDispatch(func(raw []byte) { pa.processOnebotMessageEvent(raw, conn) })
+	defer conn.close()
 
 	// The event is dispatched immediately after the peer has written the
 	// registration ACK, while this process has not yet consumed its action echo.
@@ -292,8 +318,8 @@ func TestOnebotBridgeFreshDefaultNativeRoll(t *testing.T) {
 	d.ExtRegistry = new(SyncMap[string, *ExtInfo])
 	d.registerBuiltinExtForRuntime()
 	d.applyOnebotBridgeIsolation()
-	if len(d.ExtList) != 3 || len(d.Config.ExtDefaultSettings) != 3 {
-		t.Fatalf("fresh bridge fixture registered %d extensions and %d defaults, want three each", len(d.ExtList), len(d.Config.ExtDefaultSettings))
+	if len(d.ExtList) != 4 || len(d.Config.ExtDefaultSettings) != 4 {
+		t.Fatalf("fresh bridge fixture registered %d extensions and %d defaults, want four each", len(d.ExtList), len(d.Config.ExtDefaultSettings))
 	}
 	if _, exists := d.ImSession.ServiceAtNew.Load("QQ-Group:22001"); exists {
 		t.Fatal("fresh bridge fixture unexpectedly has a pre-existing group")

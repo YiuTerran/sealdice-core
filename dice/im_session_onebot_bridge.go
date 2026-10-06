@@ -77,6 +77,7 @@ var onebotBridgeNativeCommands = map[string]struct{}{
 	"ww": {}, "dx": {}, "ek": {}, "rsr": {}, "coc": {}, "dnd": {}, "dndx": {}, "ti": {}, "li": {},
 	"userid": {}, "find": {}, "查询": {}, "setcoc": {}, "ss": {}, "buff": {}, "ds": {}, "死亡豁免": {}, "init": {},
 	"jrrp": {}, "gugu": {}, "咕咕": {}, "ping": {}, "master": {}, "ban": {},
+	"log": {},
 }
 
 // executeOnebotBridgeNew keeps the regular native parser and PreTriggerCommand
@@ -113,7 +114,7 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 		// or player registration can change shared state for a denied rule write.
 		preview := &MsgContext{Dice: d, Session: s, EndPoint: ep, MessageType: "group",
 			Group: onebotBridgePreviewGroup(mctx, msg.GroupID)}
-		previewArgs := (&CmdArgs{}).commandParseNew(preview, msg, true)
+		previewArgs := onebotBridgeCommandParse(preview, msg)
 		if previewArgs != nil && onebotBridgeCommandRequiresGroupAdmin(preview, strings.ToLower(previewArgs.Command), previewArgs) {
 			if allowed, failureStage := tracker.groupRoleAuthorization(); !allowed {
 				tracker.markFailedAt(failureStage)
@@ -157,7 +158,7 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 	VarSetValueStr(mctx, "$tMsgID", fmt.Sprintf("%v", msg.RawID))
 	mctx.IsCurGroupBotOn = msg.MessageType == "group" && mctx.Group != nil && mctx.Group.IsActive(mctx)
 
-	cmdArgs := (&CmdArgs{}).commandParseNew(mctx, msg, true)
+	cmdArgs := onebotBridgeCommandParse(mctx, msg)
 	if cmdArgs == nil {
 		tracker.markFailedAt("command_parse_failed")
 		return
@@ -195,6 +196,26 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 	}
 	mctx.CommandID = getNextCommandID()
 	SetTempVars(mctx, msg.Sender.Nickname)
+
+	if command == "log" {
+		if !tracker.beginTask() {
+			tracker.markFailedAt("request_already_terminal")
+			return
+		}
+		go func() {
+			defer tracker.finishTask()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					tracker.markFailedAt("log_command_panic")
+					if d.Logger != nil {
+						d.Logger.Warnf("OneBot LLM bridge log command failed: source_message_id=%d", tracker.sourceMessage)
+					}
+				}
+			}()
+			executeOnebotBridgeLogCommand(mctx, msg, cmdArgs)
+		}()
+		return
+	}
 
 	if !tracker.beginTask() {
 		tracker.markFailedAt("request_already_terminal")
@@ -270,6 +291,38 @@ func onebotBridgePreviewGroup(ctx *MsgContext, groupID string) *GroupInfo {
 	return group
 }
 
+// onebotBridgeCommandParse keeps .log in the native parser's command registry
+// for bridge requests even when the extension is inactive in the live group.
+// Parsing uses a detached group view and the bridge handler intercepts .log
+// before PreTriggerCommand, so this does not activate the extension or its hooks.
+func onebotBridgeCommandParse(ctx *MsgContext, msg *Message) *CmdArgs {
+	if ctx == nil || msg == nil {
+		return nil
+	}
+	if msg.MessageType == "group" && strings.HasPrefix(msg.Message, ".log ") {
+		parseGroup := onebotBridgePreviewGroup(ctx, msg.GroupID)
+		logExtName := "log"
+		if ctx.Dice.onebotBridgeIsolated {
+			logExtName = "bridge-log"
+		}
+		if logExt := ctx.Dice.ExtFind(logExtName, false); logExt != nil {
+			found := false
+			for _, existing := range parseGroup.activatedExtList {
+				if existing != nil && strings.EqualFold(existing.Name, logExt.Name) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				parseGroup.activatedExtList = append(parseGroup.activatedExtList, logExt)
+			}
+		}
+		parseCtx := &MsgContext{Dice: ctx.Dice, Session: ctx.Session, EndPoint: ctx.EndPoint, Group: parseGroup, MessageType: ctx.MessageType}
+		return (&CmdArgs{}).commandParseNew(parseCtx, msg, true)
+	}
+	return (&CmdArgs{}).commandParseNew(ctx, msg, true)
+}
+
 func onebotBridgePrivateQueryContext(ctx *MsgContext, msg *Message) (*GroupInfo, *GroupPlayerInfo) {
 	groupID := "PG-" + msg.Sender.UserID
 	group := onebotBridgePreviewGroup(ctx, groupID)
@@ -306,6 +359,9 @@ func onebotBridgeCommandAllowed(ctx *MsgContext, command string, cmdArgs *CmdArg
 	}
 	if len(cmdArgs.At) != 0 {
 		return false
+	}
+	if command == "log" {
+		return ctx != nil && !ctx.IsPrivate && onebotBridgeParseLogCommand(cmdArgs.RawText) != nil
 	}
 	if (command == "coc" || command == "dnd" || command == "dndx") && !onebotBridgeCardCountAllowed(cmdArgs) {
 		return false
@@ -371,6 +427,12 @@ func onebotBridgeCommandAllowed(ctx *MsgContext, command string, cmdArgs *CmdArg
 // native operation that changes shared group rules. Personal character and
 // attribute commands remain ordinary member operations.
 func onebotBridgeCommandRequiresGroupAdmin(ctx *MsgContext, command string, cmdArgs *CmdArgs) bool {
+	if command == "log" {
+		if cmdArgs != nil && len(cmdArgs.Args) > 0 {
+			return onebotBridgeLogActionRequiresAdmin(strings.ToLower(cmdArgs.Args[0]))
+		}
+		return false
+	}
 	return command == "set" && isOnebotBridgeRuleSelection(ctx, cmdArgs)
 }
 
@@ -559,6 +621,15 @@ func bridgeNumericID(value, prefix string) bool {
 // otherwise write defaults or refresh timestamps while serving the response.
 func onebotBridgeIsReadOnlyCommand(command string, cmdArgs *CmdArgs) bool {
 	if cmdArgs == nil {
+		return false
+	}
+	if command == "log" {
+		if parsed := onebotBridgeParseLogCommand(cmdArgs.RawText); parsed != nil {
+			switch parsed.action {
+			case "list", "stat", "get", "export":
+				return true
+			}
+		}
 		return false
 	}
 	if command == "find" || command == "查询" {
