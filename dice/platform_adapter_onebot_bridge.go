@@ -212,6 +212,7 @@ type onebotBridgeRequestTracker struct {
 	audience      string
 	userID        int64
 	groupID       int64
+	groupRole     string
 
 	mu              sync.Mutex
 	tasks           int
@@ -256,12 +257,47 @@ func newOnebotBridgeRequestTracker(p *PlatformAdapterOnebot, conn *onebotBridgeC
 			tracker.markFailed()
 			return tracker, errors.New("bridge group id is invalid")
 		}
+		tracker.groupRole = parseOnebotBridgeGroupRole(msg.Sender.GroupRole)
 	case "private":
 	default:
 		tracker.markFailed()
 		return tracker, errors.New("bridge message type is unsupported")
 	}
 	return tracker, nil
+}
+
+// parseOnebotBridgeGroupRole accepts only the roles supplied by a standard
+// OneBot group message. A missing or unexpected value stays unknown; it must
+// never be inferred from SeaDice privileges, a Master list, or another event.
+func parseOnebotBridgeGroupRole(role string) string {
+	switch role {
+	case "owner":
+		return "owner"
+	case "admin":
+		return "admin"
+	case "member":
+		return "member"
+	default:
+		return ""
+	}
+}
+
+func (r *onebotBridgeRequestTracker) groupRoleAuthorization() (bool, string) {
+	if r == nil || r.audience != "group" || r.connection == nil || r.connectionID == "" {
+		return false, "group_role_unknown"
+	}
+	connectionID, registered := r.connection.registration()
+	if !registered || connectionID != r.connectionID {
+		return false, "group_role_unknown"
+	}
+	switch r.groupRole {
+	case "owner", "admin":
+		return true, ""
+	case "member":
+		return false, "group_role_denied"
+	default:
+		return false, "group_role_unknown"
+	}
 }
 
 func onebotPositiveInt32(value any) (int64, bool) {
@@ -440,7 +476,7 @@ func (p *PlatformAdapterOnebot) registerLLMBridgeConnection(conn *onebotBridgeCo
 	params := onebotBridgeRegisterParams{
 		Version:         1,
 		BackendInstance: p.bridgeInstanceID,
-		Capabilities:    []string{"reply", "complete", "master-acl-v1"},
+		Capabilities:    []string{"reply", "complete", "master-acl-v1", "group-role-v1"},
 	}
 	ctx := conn.ctx
 	if ctx == nil {

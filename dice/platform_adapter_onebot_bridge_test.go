@@ -37,13 +37,14 @@ type onebotBridgeCapturedCompletion struct {
 type onebotBridgeCaptureEmitter struct {
 	emitter.Emitter
 
-	mu          sync.Mutex
-	sends       []onebotBridgeCapturedSend
-	completions []onebotBridgeCapturedCompletion
-	sendErr     error
-	sendStarted chan struct{}
-	releaseSend chan struct{}
-	completeCh  chan onebotBridgeCompleteParams
+	mu            sync.Mutex
+	sends         []onebotBridgeCapturedSend
+	completions   []onebotBridgeCapturedCompletion
+	registrations []onebotBridgeRegisterParams
+	sendErr       error
+	sendStarted   chan struct{}
+	releaseSend   chan struct{}
+	completeCh    chan onebotBridgeCompleteParams
 }
 
 var _ emitter.Emitter = (*onebotBridgeCaptureEmitter)(nil)
@@ -80,6 +81,17 @@ func (e *onebotBridgeCaptureEmitter) SendGrMsg(_ context.Context, groupID int64,
 
 func (e *onebotBridgeCaptureEmitter) Raw(_ context.Context, action emitter.Action, params any) ([]byte, error) {
 	if action == onebotLLMBridgeRegisterAction {
+		encoded, err := json.Marshal(params)
+		if err != nil {
+			return nil, err
+		}
+		var registration onebotBridgeRegisterParams
+		if err := json.Unmarshal(encoded, &registration); err != nil {
+			return nil, err
+		}
+		e.mu.Lock()
+		e.registrations = append(e.registrations, registration)
+		e.mu.Unlock()
 		return []byte(`{"status":"ok","retcode":0,"data":{"version":1,"connection_id":"registered-connection"}}`), nil
 	}
 	if action != onebotLLMBridgeCompleteAction {
@@ -105,7 +117,7 @@ func (e *onebotBridgeCaptureEmitter) Raw(_ context.Context, action emitter.Actio
 func (e *onebotBridgeCaptureEmitter) HandleEcho(emitter.Response[sonic.NoCopyRawMessage]) {}
 func (e *onebotBridgeCaptureEmitter) GetDroppedEchoCount() uint64                         { return 0 }
 
-func newOnebotBridgeTestTracker(t *testing.T, p *PlatformAdapterOnebot, em *onebotBridgeCaptureEmitter, audience string, sourceID, userID, groupID int64, connectionID string) (*onebotBridgeConnection, *onebotBridgeRequestTracker) {
+func newOnebotBridgeTestTracker(t *testing.T, p *PlatformAdapterOnebot, em *onebotBridgeCaptureEmitter, audience string, sourceID, userID, groupID int64, connectionID string, roles ...string) (*onebotBridgeConnection, *onebotBridgeRequestTracker) {
 	t.Helper()
 	conn := &onebotBridgeConnection{
 		emitter:      em,
@@ -118,6 +130,9 @@ func newOnebotBridgeTestTracker(t *testing.T, p *PlatformAdapterOnebot, em *oneb
 		RawID:       sourceID,
 		Sender:      SenderBase{UserID: "QQ:" + strconvFormatInt(userID)},
 	}
+	if len(roles) > 0 {
+		msg.Sender.GroupRole = roles[0]
+	}
 	if audience == "group" {
 		msg.GroupID = "QQ-Group:" + strconvFormatInt(groupID)
 	}
@@ -126,6 +141,72 @@ func newOnebotBridgeTestTracker(t *testing.T, p *PlatformAdapterOnebot, em *oneb
 		t.Fatalf("newOnebotBridgeRequestTracker() error = %v", err)
 	}
 	return conn, tracker
+}
+
+func TestOnebotBridgeRegistrationAdvertisesGroupRoleCapability(t *testing.T) {
+	em := &onebotBridgeCaptureEmitter{}
+	conn := &onebotBridgeConnection{emitter: em, ctx: context.Background(), registerDone: make(chan struct{})}
+	adapter := &PlatformAdapterOnebot{LLMBridgeEnabled: true, logger: zap.NewNop().Sugar()}
+	if err := adapter.registerLLMBridgeConnection(conn); err != nil {
+		t.Fatalf("registerLLMBridgeConnection() error = %v", err)
+	}
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	if len(em.registrations) != 1 {
+		t.Fatalf("registration count = %d, want 1", len(em.registrations))
+	}
+	for _, capability := range em.registrations[0].Capabilities {
+		if capability == "group-role-v1" {
+			return
+		}
+	}
+	t.Fatalf("registration capabilities = %v, missing group-role-v1", em.registrations[0].Capabilities)
+}
+
+func TestOnebotBridgeRequestTrackerCapturesOnlyStandardGroupRoles(t *testing.T) {
+	adapter := &PlatformAdapterOnebot{LLMBridgeEnabled: true, logger: zap.NewNop().Sugar()}
+	for _, testCase := range []struct {
+		name     string
+		audience string
+		role     string
+		wantRole string
+	}{
+		{name: "owner", audience: "group", role: "owner", wantRole: "owner"},
+		{name: "admin", audience: "group", role: "admin", wantRole: "admin"},
+		{name: "member", audience: "group", role: "member", wantRole: "member"},
+		{name: "missing role", audience: "group", wantRole: ""},
+		{name: "invalid role", audience: "group", role: "master", wantRole: ""},
+		{name: "uppercase role", audience: "group", role: "ADMIN", wantRole: ""},
+		{name: "padded role", audience: "group", role: " admin ", wantRole: ""},
+		{name: "private role", audience: "private", role: "owner", wantRole: ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			conn := &onebotBridgeConnection{registerDone: make(chan struct{})}
+			conn.setRegistration("role-connection", true)
+			msg := &Message{
+				MessageType: testCase.audience,
+				RawID:       int64(801),
+				Sender:      SenderBase{UserID: "QQ:20001", GroupRole: testCase.role},
+			}
+			if testCase.audience == "group" {
+				msg.GroupID = "QQ-Group:10001"
+			}
+			tracker, err := newOnebotBridgeRequestTracker(adapter, conn, msg)
+			if err != nil {
+				t.Fatalf("newOnebotBridgeRequestTracker() error = %v", err)
+			}
+			if tracker.groupRole != testCase.wantRole {
+				t.Fatalf("captured group role = %q, want %q", tracker.groupRole, testCase.wantRole)
+			}
+			msg.Sender.GroupRole = "owner"
+			if tracker.groupRole != testCase.wantRole {
+				t.Fatal("tracker role changed after the source message was mutated")
+			}
+			if tracker.connectionID != "role-connection" || tracker.connection != conn {
+				t.Fatal("tracker did not bind role to the registered source connection")
+			}
+		})
+	}
 }
 
 func strconvFormatInt(value int64) string {

@@ -103,7 +103,23 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 		tracker.markFailedAt("unsupported_message_type")
 		return
 	}
+	bridgeInput := extractResultFromSegments(msg.Segment)
+	if !onebotBridgeInputAllowed(bridgeInput) {
+		tracker.markFailedAt("command_too_long")
+		return
+	}
 	if msg.MessageType == "group" {
+		// Parse against a detached view before group activation, extension sync,
+		// or player registration can change shared state for a denied rule write.
+		preview := &MsgContext{Dice: d, Session: s, EndPoint: ep, MessageType: "group",
+			Group: onebotBridgePreviewGroup(mctx, msg.GroupID)}
+		previewArgs := (&CmdArgs{}).commandParseNew(preview, msg, true)
+		if previewArgs != nil && onebotBridgeCommandRequiresGroupAdmin(preview, strings.ToLower(previewArgs.Command), previewArgs) {
+			if allowed, failureStage := tracker.groupRoleAuthorization(); !allowed {
+				tracker.markFailedAt(failureStage)
+				return
+			}
+		}
 		groupInfo, ok := s.ServiceAtNew.Load(msg.GroupID)
 		if !ok && msg.GroupID != "" {
 			groupInfo = SetBotOnAtGroup(mctx, msg.GroupID)
@@ -141,11 +157,6 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 	VarSetValueStr(mctx, "$tMsgID", fmt.Sprintf("%v", msg.RawID))
 	mctx.IsCurGroupBotOn = msg.MessageType == "group" && mctx.Group != nil && mctx.Group.IsActive(mctx)
 
-	bridgeInput := extractResultFromSegments(msg.Segment)
-	if !onebotBridgeInputAllowed(bridgeInput) {
-		tracker.markFailedAt("command_too_long")
-		return
-	}
 	cmdArgs := (&CmdArgs{}).commandParseNew(mctx, msg, true)
 	if cmdArgs == nil {
 		tracker.markFailedAt("command_parse_failed")
@@ -155,6 +166,12 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 	if !onebotBridgeCommandAllowed(mctx, command, cmdArgs) {
 		tracker.markFailedAt("command_not_allowed")
 		return
+	}
+	if onebotBridgeCommandRequiresGroupAdmin(mctx, command, cmdArgs) {
+		if allowed, failureStage := tracker.groupRoleAuthorization(); !allowed {
+			tracker.markFailedAt(failureStage)
+			return
+		}
 	}
 	banMessage := *msg
 	banMessage.Message = ""
@@ -198,8 +215,7 @@ func (s *IMSession) executeOnebotBridgeNew(ep *EndPointInfo, msg *Message) {
 // onebotBridgePrivateQueryContext gives private read-only commands a transient
 // private group/player view. The normal GetPlayerInfoBySender path activates
 // and marks PG-* groups dirty even for queries.
-func onebotBridgePrivateQueryContext(ctx *MsgContext, msg *Message) (*GroupInfo, *GroupPlayerInfo) {
-	groupID := "PG-" + msg.Sender.UserID
+func onebotBridgePreviewGroup(ctx *MsgContext, groupID string) *GroupInfo {
 	source, _ := ctx.Session.ServiceAtNew.Load(groupID)
 	group := &GroupInfo{
 		GroupID:           groupID,
@@ -251,6 +267,12 @@ func onebotBridgePrivateQueryContext(ctx *MsgContext, msg *Message) (*GroupInfo,
 		group.activatedExtList = append(group.activatedExtList, setting.ExtItem)
 		activated[setting.Name] = struct{}{}
 	}
+	return group
+}
+
+func onebotBridgePrivateQueryContext(ctx *MsgContext, msg *Message) (*GroupInfo, *GroupPlayerInfo) {
+	groupID := "PG-" + msg.Sender.UserID
+	group := onebotBridgePreviewGroup(ctx, groupID)
 	if ctx.Dice.DBOperator != nil {
 		if err := service.GroupPlayerIdentityRegister(ctx.Dice.DBOperator, groupID, msg.Sender.UserID, msg.Sender.Nickname); err != nil {
 			ctx.Dice.Logger.Warnf("OneBot bridge private identity registration failed: %v", err)
@@ -343,6 +365,13 @@ func onebotBridgeCommandAllowed(ctx *MsgContext, command string, cmdArgs *CmdArg
 		// argument parser but do not accept bridge-level keyword switches.
 		return len(cmdArgs.Kwargs) == 0
 	}
+}
+
+// onebotBridgeCommandRequiresGroupAdmin classifies the only currently exposed
+// native operation that changes shared group rules. Personal character and
+// attribute commands remain ordinary member operations.
+func onebotBridgeCommandRequiresGroupAdmin(ctx *MsgContext, command string, cmdArgs *CmdArgs) bool {
+	return command == "set" && isOnebotBridgeRuleSelection(ctx, cmdArgs)
 }
 
 func onebotBridgeCardCountAllowed(cmdArgs *CmdArgs) bool {

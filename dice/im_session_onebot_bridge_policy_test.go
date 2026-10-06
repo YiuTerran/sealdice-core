@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
 	"sealdice-core/dice/service"
 	"sealdice-core/model"
 	"sealdice-core/utils/constant"
@@ -143,6 +145,221 @@ func TestOnebotBridgeSetCommandExecuteNewLifecycle(t *testing.T) {
 				t.Fatalf("rejected command sent %d replies", sendCount)
 			}
 		})
+	}
+}
+
+func TestOnebotBridgeGroupRuleSelectionRequiresBoundOwnerOrAdmin(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	em := &onebotBridgeCaptureEmitter{completeCh: make(chan onebotBridgeCompleteParams, 16)}
+	pa := &PlatformAdapterOnebot{EndPoint: ep, LLMBridgeEnabled: true, logger: d.Logger}
+	ep.Adapter = pa
+	ep.Session = d.ImSession
+
+	testCases := []struct {
+		name              string
+		role              string
+		master            bool
+		replaceConnection bool
+		wantAllowed       bool
+	}{
+		{name: "owner", role: "owner", wantAllowed: true},
+		{name: "admin", role: "admin", wantAllowed: true},
+		{name: "member", role: "member"},
+		{name: "unknown", role: ""},
+		{name: "invalid", role: "master"},
+		{name: "configured master remains member", role: "member", master: true},
+		{name: "replaced connection role is unknown", role: "owner", replaceConnection: true},
+	}
+	for i, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			const userID int64 = 22201
+			groupNumber := int64(22300 + i)
+			groupID := "QQ-Group:" + strconvFormatInt(groupNumber)
+			sourceID := int64(650 + i)
+			setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession, MessageType: "group"}
+			group := SetBotOnAtGroup(setupCtx, groupID)
+			group.Active = true
+			group.System = "coc7"
+			group.DiceSideNum = 100
+			group.CocRuleIndex = 3
+			if testCase.master {
+				d.DiceMasters = []string{"QQ:" + strconvFormatInt(userID)}
+			} else {
+				d.DiceMasters = nil
+			}
+
+			conn, tracker := newOnebotBridgeTestTracker(t, pa, em, "group", sourceID, userID, groupNumber, "set-rule-"+strconvFormatInt(sourceID), testCase.role)
+			if testCase.replaceConnection {
+				conn.setRegistration("replacement-"+strconvFormatInt(sourceID), true)
+			}
+			msg := newGroupMsg(groupID, "QQ:"+strconvFormatInt(userID), ".set dnd")
+			if testCase.wantAllowed {
+				msg.Sender.GroupRole = "member"
+			} else {
+				msg.Sender.GroupRole = "owner"
+			}
+			msg.RawID = sourceID
+			msg.LLMBridgeRequest = tracker
+
+			d.ImSession.ExecuteNew(ep, msg)
+			// Mirror processOnebotMessageEvent's terminal-task defer around ExecuteNew.
+			tracker.finishTask()
+			select {
+			case completion := <-em.completeCh:
+				if testCase.wantAllowed && (completion.Status != "ok" || completion.OutputCount == 0) {
+					t.Fatalf("authorized .set dnd completion = %#v, want ok with a reply", completion)
+				}
+				if !testCase.wantAllowed && (completion.Status != "failed" || completion.OutputCount != 0) {
+					t.Fatalf("denied .set dnd completion = %#v, want failed with no reply", completion)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal(".set dnd did not complete")
+			}
+
+			if testCase.wantAllowed {
+				if group.System != "dnd5e" || group.DiceSideNum != 20 {
+					t.Fatalf("authorized .set dnd state = system %q dice sides %d, want dnd5e / 20", group.System, group.DiceSideNum)
+				}
+			} else if group.System != "coc7" || group.DiceSideNum != 100 || group.CocRuleIndex != 3 {
+				t.Fatalf("denied .set dnd changed group state: system=%q dice sides=%d COC rule=%d", group.System, group.DiceSideNum, group.CocRuleIndex)
+			}
+		})
+	}
+}
+
+func TestOnebotBridgeGroupRoleGateDoesNotChangeOrdinaryOnebotExecution(t *testing.T) {
+	d, ep, adapter, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	groupID := "QQ-Group:22401"
+	setupCtx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession, MessageType: "group"}
+	group := SetBotOnAtGroup(setupCtx, groupID)
+	group.Active = true
+	group.System = "coc7"
+	group.DiceSideNum = 100
+
+	msg := newGroupMsg(groupID, "QQ:22402", ".set dnd")
+	msg.Sender.GroupRole = "member"
+	d.ImSession.ExecuteNew(ep, msg)
+	if _, ok := adapter.waitForMsg(2 * time.Second); !ok {
+		t.Fatal("ordinary OneBot .set dnd did not produce a reply")
+	}
+	if group.System != "dnd5e" || group.DiceSideNum != 20 {
+		t.Fatalf("ordinary OneBot .set dnd state = system %q dice sides %d, want dnd5e / 20", group.System, group.DiceSideNum)
+	}
+}
+
+func TestOnebotBridgeDeniedRuleDoesNotCreateOrActivateGroup(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	em := &onebotBridgeCaptureEmitter{completeCh: make(chan onebotBridgeCompleteParams, 8)}
+	pa := &PlatformAdapterOnebot{EndPoint: ep, LLMBridgeEnabled: true, logger: d.Logger}
+	ep.Adapter = pa
+	ep.Session = d.ImSession
+	for i, existing := range []bool{false, true} {
+		groupNumber := int64(22600 + i)
+		groupID := "QQ-Group:" + strconvFormatInt(groupNumber)
+		var group *GroupInfo
+		if existing {
+			group = SetBotOnAtGroup(&MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession}, groupID)
+			group.Active = false
+			group.DiceIDActiveMap.Store(ep.UserID, false)
+			group.GroupName = "original"
+			group.UpdatedAtTime = 17
+		}
+		sourceID := int64(750 + i)
+		_, tracker := newOnebotBridgeTestTracker(t, pa, em, "group", sourceID, 22610, groupNumber, "denied-fresh", "member")
+		msg := newGroupMsg(groupID, "QQ:22610", ".set dnd")
+		msg.GroupName = "must-not-be-copied"
+		msg.RawID, msg.LLMBridgeRequest = sourceID, tracker
+		d.ImSession.ExecuteNew(ep, msg)
+		tracker.finishTask()
+		select {
+		case terminal := <-em.completeCh:
+			if terminal.Status != "failed" || terminal.OutputCount != 0 {
+				t.Fatalf("denied rule completed with output: %#v", terminal)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("denied rule did not complete")
+		}
+		stored, found := d.ImSession.ServiceAtNew.Load(groupID)
+		if !existing && found {
+			t.Fatal("denied rule created a group")
+		}
+		if existing {
+			if !found || stored != group || group.Active || group.GroupName != "original" || group.UpdatedAtTime != 17 {
+				t.Fatal("denied rule activated or dirtied the existing group")
+			}
+			if active, _ := group.DiceIDActiveMap.Load(ep.UserID); active {
+				t.Fatal("denied rule activated the endpoint")
+			}
+		}
+	}
+}
+
+func TestOnebotBridgeGroupRoleRecheckedAtNativeSolve(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	em := &onebotBridgeCaptureEmitter{completeCh: make(chan onebotBridgeCompleteParams, 1)}
+	pa := &PlatformAdapterOnebot{EndPoint: ep, LLMBridgeEnabled: true, logger: d.Logger}
+	ep.Adapter = pa
+	ep.Session = d.ImSession
+	ctx := &MsgContext{Dice: d, EndPoint: ep, Session: d.ImSession, MessageType: "group"}
+	ctx.Group = SetBotOnAtGroup(ctx, "QQ-Group:22701")
+	ctx.Group.System, ctx.Group.DiceSideNum = "coc7", 100
+	conn, tracker := newOnebotBridgeTestTracker(t, pa, em, "group", 770, 22702, 22701, "original-solve-connection", "owner")
+	ctx.LLMBridgeRequest = tracker
+	msg := newGroupMsg("QQ-Group:22701", "QQ:22702", ".set dnd")
+	msg.RawID, msg.LLMBridgeRequest = int64(770), tracker
+	args := (&CmdArgs{}).commandParseNew(ctx, msg, true)
+	if args == nil {
+		t.Fatal("native parser did not match .set")
+	}
+	if allowed, _ := tracker.groupRoleAuthorization(); !allowed {
+		t.Fatal("owner not authorized on original connection")
+	}
+	conn.setRegistration("replacement-solve-connection", true)
+	if d.ImSession.commandSolveRestricted(ctx, msg, args, true) {
+		t.Fatal("revoked connection executed rule solver")
+	}
+	if ctx.Group.System != "coc7" || ctx.Group.DiceSideNum != 100 {
+		t.Fatal("revoked connection changed group rules")
+	}
+	tracker.finishTask()
+}
+
+func TestOnebotBridgeRequestCaptureUsesParsedSenderRole(t *testing.T) {
+	adapter := &PlatformAdapterOnebot{LLMBridgeEnabled: true, logger: zap.NewNop().Sugar()}
+	conn := &onebotBridgeConnection{registerDone: make(chan struct{})}
+	conn.setRegistration("source-role-connection", true)
+	for _, testCase := range []struct {
+		role string
+		want string
+	}{
+		{role: "owner", want: "owner"},
+		{role: "admin", want: "admin"},
+		{role: "member", want: "member"},
+		{role: "invalid", want: ""},
+		{role: "ADMIN", want: ""},
+		{role: " admin ", want: ""},
+		{role: "", want: ""},
+	} {
+		roleField := `,"role":"` + testCase.role + `"`
+		if testCase.role == "" {
+			roleField = ""
+		}
+		raw := []byte(`{"message_type":"group","user_id":20001,"group_id":10001,"message_id":701,"raw_message":".set dnd","message":[{"type":"text","data":{"text":".set dnd"}}],"sender":{"user_id":20001,"nickname":"Player"` + roleField + `}}`)
+		msg, err := arrayByte2SealdiceMessage(zap.NewNop().Sugar(), raw)
+		if err != nil {
+			t.Fatalf("arrayByte2SealdiceMessage(role=%q) error = %v", testCase.role, err)
+		}
+		tracker, err := newOnebotBridgeRequestTracker(adapter, conn, msg)
+		if err != nil {
+			t.Fatalf("newOnebotBridgeRequestTracker(role=%q) error = %v", testCase.role, err)
+		}
+		if tracker.groupRole != testCase.want || tracker.connectionID != "source-role-connection" {
+			t.Errorf("captured role/connection = %q/%q, want %q/source-role-connection", tracker.groupRole, tracker.connectionID, testCase.want)
+		}
 	}
 }
 

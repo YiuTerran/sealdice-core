@@ -2250,6 +2250,14 @@ func (s *IMSession) commandSolveRestricted(ctx *MsgContext, msg *Message, cmdArg
 			return false
 		}
 		ctx.LLMBridgeReadOnly = onebotBridgeIsReadOnlyCommand(command, cmdArgs)
+		if onebotBridgeCommandRequiresGroupAdmin(ctx, command, cmdArgs) {
+			if allowed, failureStage := ctx.LLMBridgeRequest.groupRoleAuthorization(); !allowed {
+				if ctx.LLMBridgeRequest != nil {
+					ctx.LLMBridgeRequest.markFailedAt(failureStage + "_at_solve")
+				}
+				return false
+			}
+		}
 		if (command == "master" || command == "ban") && !isOnebotBridgeMasterCommand(ctx, msg, cmdArgs) {
 			if ctx.LLMBridgeRequest != nil {
 				ctx.LLMBridgeRequest.markFailedAt("master_acl_denied_at_solve")
