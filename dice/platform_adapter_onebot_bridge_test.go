@@ -96,8 +96,8 @@ func (e *onebotBridgeCaptureEmitter) Raw(_ context.Context, action emitter.Actio
 			return nil, err
 		}
 		var registration onebotBridgeRegisterParams
-		if err := json.Unmarshal(encoded, &registration); err != nil {
-			return nil, err
+		if unmarshalErr := json.Unmarshal(encoded, &registration); unmarshalErr != nil {
+			return nil, unmarshalErr
 		}
 		e.mu.Lock()
 		e.registrations = append(e.registrations, registration)
