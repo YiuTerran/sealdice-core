@@ -267,6 +267,103 @@ func TestOnebotBridgeLogSnapshotWalkUsesBoundedIDPages(t *testing.T) {
 	}
 }
 
+func TestOnebotBridgeLogSnapshotPrepareAndRenderShareOneCutoff(t *testing.T) {
+	dbPath := filepath.ToSlash(filepath.Join(t.TempDir(), "two-pass-snapshot.db"))
+	db, openErr := openLogInfoTestDB(dbPath)
+	if openErr != nil {
+		t.Fatalf("open primary SQLite db: %v", openErr)
+	}
+	if pragmaErr := db.Exec("PRAGMA journal_mode=WAL").Error; pragmaErr != nil {
+		t.Fatalf("enable WAL for deterministic concurrent append: %v", pragmaErr)
+	}
+	if migrateErr := db.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}, &model.OnebotBridgeLogEvent{}, &model.OnebotBridgeLogState{}); migrateErr != nil {
+		t.Fatalf("migrate primary SQLite db: %v", migrateErr)
+	}
+	primarySQLDB, primaryErr := db.DB()
+	if primaryErr != nil {
+		t.Fatalf("get primary sql db: %v", primaryErr)
+	}
+	t.Cleanup(func() { _ = primarySQLDB.Close() })
+	writerDB, writerErr := openLogInfoTestDB(dbPath)
+	if writerErr != nil {
+		t.Fatalf("open concurrent SQLite writer: %v", writerErr)
+	}
+	writerSQLDB, writerSQLErr := writerDB.DB()
+	if writerSQLErr != nil {
+		t.Fatalf("get concurrent writer sql db: %v", writerSQLErr)
+	}
+	t.Cleanup(func() { _ = writerSQLDB.Close() })
+	op := &logInfoTestOperator{db: db, dbType: constant.SQLITE}
+	groupID := "QQ-Group:8000000000000012"
+	state, stateErr := service.OnebotBridgeLogNew(op, groupID, "two-pass")
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	for index := range 5 {
+		item := &model.LogOneItem{Time: int64(1710001000 + index), Message: fmt.Sprintf("row-%d", index)}
+		if _, _, captureErr := service.LogCaptureAppend(op, fmt.Sprintf("two-pass-event-%d", index), groupID, "message", item); captureErr != nil {
+			t.Fatal(captureErr)
+		}
+	}
+	var preparedIDs, renderedIDs []uint64
+	mutated := false
+	var appendedID, deletedID uint64
+	cutoff, walkErr := service.LogCaptureSnapshotWalkWithPrepare(op, groupID, "two-pass", 2, func(page []*model.LogOneItem) error {
+		if len(page) > 2 {
+			t.Fatalf("prepare page exceeded requested bound: %d", len(page))
+		}
+		for _, row := range page {
+			preparedIDs = append(preparedIDs, row.ID)
+		}
+		if !mutated {
+			mutated = true
+			var lastOriginal model.LogOneItem
+			if queryErr := writerDB.Where("log_id = ?", state.LogID).Order("id DESC").First(&lastOriginal).Error; queryErr != nil {
+				return fmt.Errorf("find original row to delete between passes: %w", queryErr)
+			}
+			if len(page) == 0 || lastOriginal.ID <= page[len(page)-1].ID {
+				return fmt.Errorf("selected deletion row was already visited: last=%d page=%v", lastOriginal.ID, page)
+			}
+			deletedID = lastOriginal.ID
+			if deleteErr := writerDB.Delete(&lastOriginal).Error; deleteErr != nil {
+				return fmt.Errorf("delete original row between passes: %w", deleteErr)
+			}
+			appended := &model.LogOneItem{LogID: state.LogID, GroupID: groupID, Time: 1710002000, Message: "appended-between-passes"}
+			if appendErr := writerDB.Create(appended).Error; appendErr != nil {
+				return fmt.Errorf("append between snapshot passes: %w", appendErr)
+			}
+			appendedID = appended.ID
+		}
+		return nil
+	}, func(page []*model.LogOneItem) error {
+		if len(page) > 2 {
+			t.Fatalf("render page exceeded requested bound: %d", len(page))
+		}
+		for _, row := range page {
+			renderedIDs = append(renderedIDs, row.ID)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatal(walkErr)
+	}
+	if cutoff == 0 || !mutated || deletedID == 0 || appendedID == 0 || len(preparedIDs) != 5 || !reflect.DeepEqual(preparedIDs, renderedIDs) {
+		t.Fatalf("prepare/render did not share a fixed row snapshot: cutoff=%d prepare=%v render=%v", cutoff, preparedIDs, renderedIDs)
+	}
+	var rowsAfterSnapshot []model.LogOneItem
+	if postQueryErr := writerDB.Where("log_id = ?", state.LogID).Order("id ASC").Find(&rowsAfterSnapshot).Error; postQueryErr != nil {
+		t.Fatal(postQueryErr)
+	}
+	if len(rowsAfterSnapshot) != 5 || rowsAfterSnapshot[len(rowsAfterSnapshot)-1].ID != appendedID {
+		t.Fatalf("append/delete mutations were not persisted after snapshot walk: rows=%#v, appendedID=%d", rowsAfterSnapshot, appendedID)
+	}
+	for _, row := range rowsAfterSnapshot {
+		if row.ID == deletedID {
+			t.Fatalf("deleted row %d remained visible after snapshot walk", deletedID)
+		}
+	}
+}
+
 func newLogInfoMySQLTestOperator(t *testing.T) (*logInfoTestOperator, sqlmock.Sqlmock) {
 	t.Helper()
 

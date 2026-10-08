@@ -119,6 +119,231 @@ func TestOnebotBridgeCaptureFrameIngressACKDedupAndSafeRendering(t *testing.T) {
 	}
 }
 
+func TestOnebotBridgeLogDisplayMetadataRendersNamesWithoutVirtualIDs(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	logDB := d.DBOperator.GetLogDB(constant.WRITE)
+	if err := logDB.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}, &model.OnebotBridgeLogEvent{}, &model.OnebotBridgeLogState{}); err != nil {
+		t.Fatal(err)
+	}
+	const groupNumber int64 = 8000000000000121
+	const groupID = "QQ-Group:8000000000000121"
+	if _, err := service.OnebotBridgeLogNew(d.DBOperator, groupID, "display"); err != nil {
+		t.Fatal(err)
+	}
+	em := &onebotBridgeCaptureEmitter{}
+	pa := &PlatformAdapterOnebot{EndPoint: ep, LLMBridgeEnabled: true, logger: zap.NewNop().Sugar()}
+	ep.Adapter = pa
+	ep.Session = d.ImSession
+	kws := &socketio.WebsocketWrapper{}
+	conn := &onebotBridgeConnection{emitter: em, ctx: context.Background(), registerDone: make(chan struct{})}
+	conn.setRegistration("display-connection", true)
+	conn.setLogDisplayCapability("display-connection", true)
+	pa.bridgeConnections = map[*socketio.WebsocketWrapper]*onebotBridgeConnection{kws: conn}
+	conn.startDispatch(func(raw []byte) { pa.processOnebotMessageEvent(raw, conn) })
+	defer conn.close()
+
+	type frame struct {
+		PostType     string                  `json:"post_type"`
+		Version      int                     `json:"version"`
+		ConnectionID string                  `json:"connection_id"`
+		EventID      string                  `json:"event_id"`
+		GroupID      int64                   `json:"group_id"`
+		UserID       int64                   `json:"user_id"`
+		Time         int64                   `json:"time"`
+		Nickname     string                  `json:"nickname"`
+		Text         string                  `json:"text"`
+		IsBot        bool                    `json:"is_bot"`
+		Kind         string                  `json:"kind"`
+		Display      *onebotBridgeLogDisplay `json:"display,omitempty"`
+	}
+	frames := []frame{
+		{
+			PostType: onebotLLMBridgeLogEventPostType, Version: 1, ConnectionID: "display-connection", EventID: "display-event-1",
+			GroupID: groupNumber, UserID: 8000000000000122, Time: 1710000101, Nickname: "Author & One",
+			Text: "<@friend> [@789](mqqapi://markdown/mention?at_type=1&at_tinyid=789) <@unknown> <@!unknown> [@999](mqqapi://markdown/mention?at_type=1&at_tinyid=999) <@shared> <@no-name> <@bot> [@Inline](mqqapi://markdown/mention?at_type=1&at_tinyid=456) [@Old Label](mqqapi://markdown/mention?at_tinyid=123&at_type=1) [@Literal](mqqapi://markdown/mention?at_type=1&at_tinyid=654) [@openid:shared](mqqapi://markdown/mention?at_type=1&at_tinyid=655)",
+			Kind: "message", Display: &onebotBridgeLogDisplay{
+				AuthorAliases: []string{"openid:source"},
+				Mentions: []onebotBridgeLogMention{
+					{Target: "tinyid:123", Aliases: []string{"openid:linked"}, Name: "SDK <Current>"},
+					{Target: "tinyid:789", Aliases: []string{"openid:friend"}, Name: "openid:friend"},
+					{Target: "tinyid:999", Aliases: []string{"openid:unknown"}, Name: "999"},
+					{Target: "tinyid:654", Aliases: []string{"openid:shared"}, Name: "SDK conflict", IsBot: true},
+					{Target: "tinyid:655", Aliases: []string{"openid:shared"}, Name: "openid:shared"},
+					{Target: "tinyid:321", Aliases: []string{"openid:no-name"}},
+					{Target: "openid:bot", IsBot: true, Name: "ignored bot nickname"},
+				},
+			},
+		},
+		{
+			PostType: onebotLLMBridgeLogEventPostType, Version: 1, ConnectionID: "display-connection", EventID: "display-event-2",
+			GroupID: groupNumber, UserID: 8000000000000123, Time: 1710000102, Nickname: "Friend <Name>", Text: "friend's message", Kind: "message",
+			Display: &onebotBridgeLogDisplay{AuthorAliases: []string{"openid:friend"}},
+		},
+		{
+			PostType: onebotLLMBridgeLogEventPostType, Version: 1, ConnectionID: "display-connection", EventID: "display-event-3",
+			GroupID: groupNumber, UserID: 8000000000000124, Time: 1710000103, Nickname: "Other", Text: "other's message", Kind: "message",
+			Display: &onebotBridgeLogDisplay{AuthorAliases: []string{"openid:shared"}},
+		},
+		{
+			PostType: onebotLLMBridgeLogEventPostType, Version: 1, ConnectionID: "display-connection", EventID: "display-event-4",
+			GroupID: groupNumber, UserID: 8000000000000125, Time: 1710000104, Nickname: "Other Two", Text: "conflicting alias", Kind: "message",
+			Display: &onebotBridgeLogDisplay{AuthorAliases: []string{"openid:shared"}},
+		},
+		{
+			PostType: onebotLLMBridgeLogEventPostType, Version: 1, ConnectionID: "display-connection", EventID: "display-event-5",
+			GroupID: groupNumber, UserID: 8000000000000126, Time: 1710000105, Nickname: "", Text: "speaker name missing", Kind: "message",
+			Display: &onebotBridgeLogDisplay{AuthorAliases: []string{"openid:no-name"}},
+		},
+	}
+	for index, event := range frames {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dispatchOnebotRaw(t, pa, kws, string(encoded))
+		waitOnebotBridgeAction(t, em, index+1, onebotLLMBridgeLogAckAction)
+	}
+	duplicate := frames[0]
+	duplicate.Display = &onebotBridgeLogDisplay{AuthorAliases: []string{"openid:source"}, Mentions: []onebotBridgeLogMention{{Target: "tinyid:123", Name: "Changed after acceptance"}}}
+	duplicateRaw, err := json.Marshal(duplicate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatchOnebotRaw(t, pa, kws, string(duplicateRaw))
+	waitOnebotBridgeAction(t, em, len(frames)+1, onebotLLMBridgeLogAckAction)
+	markdown, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "display", "md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(markdown)
+	for _, internal := range []string{"8000000000000121", "8000000000000122", "virtual:", "<code>"} {
+		if strings.Contains(text, internal) {
+			t.Fatalf("Markdown leaked internal identity %q: %s", internal, text)
+		}
+	}
+	for _, want := range []string{"@SDK &lt;Current&gt;", "@Inline", "@Friend &lt;Name&gt;", "@机器人", "@成员1", "@成员2", "@Literal", "成员3", "Author &amp; One"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("Markdown missing %q: %s", want, text)
+		}
+	}
+	if strings.Count(text, "@成员1") != 3 {
+		t.Fatalf("repeated unknown target did not keep a stable anonymous label: %s", text)
+	}
+	plain, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "display", "txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainText := string(plain)
+	for _, internal := range []string{"8000000000000121", "8000000000000122", "virtual:"} {
+		if strings.Contains(plainText, internal) {
+			t.Fatalf("TXT leaked internal identity %q: %s", internal, plainText)
+		}
+	}
+	if !strings.Contains(plainText, frames[0].Text) {
+		t.Fatalf("TXT body did not retain the stored original mention syntax: %s", plainText)
+	}
+	if got := onebotBridgeArtifactFilename("display log", "md"); got != "display-log.md" {
+		t.Fatalf("artifact filename contains unexpected identity or normalization: %q", got)
+	}
+}
+
+func TestOnebotBridgeLogDisplayAcceptsEightLinkedAliases(t *testing.T) {
+	display := onebotBridgeLogDisplay{
+		AuthorAliases: []string{"openid:author"},
+		Mentions: []onebotBridgeLogMention{{
+			Target: "openid:primary",
+			Aliases: []string{
+				"openid:primary", "openid:alias-2", "openid:alias-3", "openid:alias-4",
+				"tinyid:1", "tinyid:2", "tinyid:3", "tinyid:4",
+			},
+		}},
+	}
+	encoded, err := json.Marshal(display)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed := parseOnebotBridgeLogDisplay(encoded); parsed == nil || len(parsed.Mentions[0].Aliases) != 7 {
+		t.Fatalf("eight aliases including a redundant target should be accepted and deduplicated: %#v", parsed)
+	}
+	display.Mentions[0].Aliases = []string{
+		"openid:alias-2", "openid:alias-3", "openid:alias-4", "openid:alias-5",
+		"tinyid:1", "tinyid:2", "tinyid:3", "tinyid:4",
+	}
+	encoded, err = json.Marshal(display)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed := parseOnebotBridgeLogDisplay(encoded); parsed != nil {
+		t.Fatalf("nine linked identities including target should be rejected: %#v", parsed)
+	}
+}
+
+func TestOnebotBridgeLogDisplayFindAliasCompressesDeepChainsIteratively(t *testing.T) {
+	writer := newOnebotBridgeLogSnapshotWriter(&strings.Builder{}, "md")
+	const chainLength = 20_000
+	for index := chainLength; index > 0; index-- {
+		writer.aliasParent[fmt.Sprintf("alias:%05d", index)] = fmt.Sprintf("alias:%05d", index-1)
+	}
+	if got := writer.findAlias(fmt.Sprintf("alias:%05d", chainLength)); got != "alias:00000" {
+		t.Fatalf("deep alias root = %q, want alias:00000", got)
+	}
+}
+
+func TestOnebotBridgeInvalidDisplayMetadataDoesNotRejectCapture(t *testing.T) {
+	d, ep, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	logDB := d.DBOperator.GetLogDB(constant.WRITE)
+	if err := logDB.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}, &model.OnebotBridgeLogEvent{}, &model.OnebotBridgeLogState{}); err != nil {
+		t.Fatal(err)
+	}
+	const groupID = "QQ-Group:8000000000000131"
+	if _, err := service.OnebotBridgeLogNew(d.DBOperator, groupID, "oversize-display"); err != nil {
+		t.Fatal(err)
+	}
+	em := &onebotBridgeCaptureEmitter{}
+	pa := &PlatformAdapterOnebot{EndPoint: ep, LLMBridgeEnabled: true, logger: zap.NewNop().Sugar()}
+	ep.Adapter = pa
+	ep.Session = d.ImSession
+	kws := &socketio.WebsocketWrapper{}
+	conn := &onebotBridgeConnection{emitter: em, ctx: context.Background(), registerDone: make(chan struct{})}
+	conn.setRegistration("display-connection", true)
+	conn.setLogDisplayCapability("display-connection", true)
+	pa.bridgeConnections = map[*socketio.WebsocketWrapper]*onebotBridgeConnection{kws: conn}
+	conn.startDispatch(func(raw []byte) { pa.processOnebotMessageEvent(raw, conn) })
+	defer conn.close()
+
+	raw := `{"post_type":"_llm_bridge_log_event","version":1,"connection_id":"display-connection","event_id":"oversize-display-event","group_id":8000000000000131,"user_id":8000000000000132,"time":1710000201,"nickname":"Member","text":"body stays","is_bot":false,"kind":"message","display":{"author_aliases":["openid:member"],"mentions":[{"target":"tinyid:123","name":"` + strings.Repeat("x", 257) + `"}]}}`
+	dispatchOnebotRaw(t, pa, kws, raw)
+	waitOnebotBridgeAction(t, em, 1, onebotLLMBridgeLogAckAction)
+	tooLargeDisplay := json.RawMessage(`{"author_aliases":["openid:member"],"padding":"` + strings.Repeat("x", onebotBridgeLogDisplayMaxBytes) + `"}`)
+	isBot := false
+	oversizeEvent := onebotBridgeLogEvent{
+		PostType: onebotLLMBridgeLogEventPostType, Version: 1, ConnectionID: "display-connection", EventID: "oversize-display-event-2",
+		GroupID: 8000000000000131, UserID: 8000000000000133, Time: 1710000202, Nickname: "Member", Text: "second body",
+		IsBot: &isBot, Kind: "message", Display: tooLargeDisplay,
+	}
+	oversizeRaw, err := json.Marshal(oversizeEvent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatchOnebotRaw(t, pa, kws, string(oversizeRaw))
+	waitOnebotBridgeAction(t, em, 2, onebotLLMBridgeLogAckAction)
+	items, err := service.LogGetAllLines(d.DBOperator, groupID, "oversize-display")
+	if err != nil || len(items) != 2 || items[0].Message != "body stays" || items[1].Message != "second body" {
+		t.Fatalf("invalid display metadata rejected source capture: items=%#v err=%v", items, err)
+	}
+	for _, item := range items {
+		info, ok := item.CommandInfo.(map[string]interface{})
+		if !ok {
+			t.Fatalf("command info was not decoded: %#v", item.CommandInfo)
+		}
+		if _, exists := info["bridgeDisplay"]; exists {
+			t.Fatalf("invalid display metadata was persisted: %#v", info)
+		}
+	}
+}
+
 func TestOnebotBridgeSnapshotRejectsOversizeWithoutArtifact(t *testing.T) {
 	d, _, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()

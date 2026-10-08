@@ -42,13 +42,14 @@ type onebotBridgeConnection struct {
 	registerDone chan struct{}
 	registerOnce sync.Once
 
-	mu                    sync.RWMutex
-	connectionID          string
-	registered            bool
-	closed                bool
-	masterACLConnectionID string
-	masterUserIDs         map[int64]struct{}
-	masterUserKeys        map[int64]string
+	mu                     sync.RWMutex
+	connectionID           string
+	registered             bool
+	closed                 bool
+	masterACLConnectionID  string
+	masterUserIDs          map[int64]struct{}
+	masterUserKeys         map[int64]string
+	logDisplayConnectionID string
 
 	dispatchMu     sync.Mutex
 	dispatchCond   *sync.Cond
@@ -77,12 +78,16 @@ func (c *onebotBridgeConnection) setRegistration(connectionID string, registered
 			c.masterUserIDs = nil
 			c.masterUserKeys = nil
 		}
+		if !registered || c.logDisplayConnectionID != connectionID {
+			c.logDisplayConnectionID = ""
+		}
 	} else {
 		c.connectionID = ""
 		c.registered = false
 		c.masterACLConnectionID = ""
 		c.masterUserIDs = nil
 		c.masterUserKeys = nil
+		c.logDisplayConnectionID = ""
 	}
 	c.mu.Unlock()
 	c.registerOnce.Do(func() {
@@ -90,6 +95,28 @@ func (c *onebotBridgeConnection) setRegistration(connectionID string, registered
 			close(c.registerDone)
 		}
 	})
+}
+
+func (c *onebotBridgeConnection) setLogDisplayCapability(connectionID string, enabled bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if !c.closed && c.registered && c.connectionID == connectionID && enabled {
+		c.logDisplayConnectionID = connectionID
+	} else {
+		c.logDisplayConnectionID = ""
+	}
+	c.mu.Unlock()
+}
+
+func (c *onebotBridgeConnection) hasLogDisplayCapability(connectionID string) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return !c.closed && c.registered && c.connectionID == connectionID && c.logDisplayConnectionID == connectionID
 }
 
 func (c *onebotBridgeConnection) close() {
@@ -103,6 +130,7 @@ func (c *onebotBridgeConnection) close() {
 	c.masterACLConnectionID = ""
 	c.masterUserIDs = nil
 	c.masterUserKeys = nil
+	c.logDisplayConnectionID = ""
 	c.mu.Unlock()
 	if c.cancel != nil {
 		c.cancel()
@@ -320,6 +348,7 @@ type onebotBridgeCompleteParams struct {
 type onebotBridgeRegisterResult struct {
 	Version       int             `json:"version"`
 	ConnectionID  string          `json:"connection_id"`
+	Capabilities  []string        `json:"capabilities"`
 	Authorization json.RawMessage `json:"authorization"`
 }
 
@@ -615,7 +644,7 @@ func (p *PlatformAdapterOnebot) registerLLMBridgeConnection(conn *onebotBridgeCo
 	params := onebotBridgeRegisterParams{
 		Version:         1,
 		BackendInstance: p.bridgeInstanceID,
-		Capabilities:    []string{"reply", "complete", "master-acl-v1", "group-role-v1", "log-capture-v1", "artifact-v1"},
+		Capabilities:    []string{"reply", "complete", "master-acl-v1", "group-role-v1", "log-capture-v1", "artifact-v1", "log-display-v1"},
 	}
 	ctx := conn.ctx
 	if ctx == nil {
@@ -651,6 +680,7 @@ func (p *PlatformAdapterOnebot) registerLLMBridgeConnection(conn *onebotBridgeCo
 		return fmt.Errorf("persist bridge reconnect gaps: %w", err)
 	}
 	conn.setRegistration(result.ConnectionID, true)
+	conn.setLogDisplayCapability(result.ConnectionID, stringSliceContains(result.Capabilities, "log-display-v1"))
 	if _, registered := conn.registration(); !registered {
 		return errors.New("bridge connection closed during registration")
 	}

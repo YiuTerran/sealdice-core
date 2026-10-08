@@ -11,6 +11,7 @@ import (
 	"html"
 	"io"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -35,17 +36,30 @@ var (
 )
 
 type onebotBridgeLogEvent struct {
-	PostType     string `json:"post_type"`
-	Version      int    `json:"version"`
-	ConnectionID string `json:"connection_id"`
-	EventID      string `json:"event_id"`
-	GroupID      int64  `json:"group_id"`
-	UserID       int64  `json:"user_id"`
-	Time         int64  `json:"time"`
-	Nickname     string `json:"nickname"`
-	Text         string `json:"text"`
-	IsBot        *bool  `json:"is_bot"`
-	Kind         string `json:"kind"`
+	PostType     string          `json:"post_type"`
+	Version      int             `json:"version"`
+	ConnectionID string          `json:"connection_id"`
+	EventID      string          `json:"event_id"`
+	GroupID      int64           `json:"group_id"`
+	UserID       int64           `json:"user_id"`
+	Time         int64           `json:"time"`
+	Nickname     string          `json:"nickname"`
+	Text         string          `json:"text"`
+	IsBot        *bool           `json:"is_bot"`
+	Kind         string          `json:"kind"`
+	Display      json.RawMessage `json:"display,omitempty"`
+}
+
+type onebotBridgeLogDisplay struct {
+	AuthorAliases []string                 `json:"author_aliases"`
+	Mentions      []onebotBridgeLogMention `json:"mentions"`
+}
+
+type onebotBridgeLogMention struct {
+	Target  string   `json:"target"`
+	Aliases []string `json:"aliases,omitempty"`
+	Name    string   `json:"name,omitempty"`
+	IsBot   bool     `json:"is_bot,omitempty"`
 }
 
 type onebotBridgeLogAckParams struct {
@@ -100,21 +114,27 @@ func (p *PlatformAdapterOnebot) processOnebotBridgeLogEvent(raw []byte, conn *on
 		}
 		return
 	}
+	var display *onebotBridgeLogDisplay
+	if conn.hasLogDisplayCapability(connectionID) {
+		display = parseOnebotBridgeLogDisplay(event.Display)
+	}
 	if p.EndPoint == nil || p.EndPoint.Session == nil || p.EndPoint.Session.Parent == nil {
 		_ = p.emitOnebotBridgeLogAck(conn, connectionID, event.EventID, "failed")
 		return
 	}
+	commandInfo := map[string]interface{}{"bridgeCaptureKind": event.Kind}
+	if display != nil {
+		commandInfo["bridgeDisplay"] = display
+	}
 	item := &model.LogOneItem{
-		Nickname:  event.Nickname,
-		IMUserID:  strconv.FormatInt(event.UserID, 10),
-		UniformID: fmt.Sprintf("OneBotBridge:QQ:%d", event.UserID),
-		Time:      event.Time,
-		Message:   event.Text,
-		IsDice:    *event.IsBot,
-		RawMsgID:  event.EventID,
-		CommandInfo: map[string]string{
-			"bridgeCaptureKind": event.Kind,
-		},
+		Nickname:    event.Nickname,
+		IMUserID:    strconv.FormatInt(event.UserID, 10),
+		UniformID:   fmt.Sprintf("OneBotBridge:QQ:%d", event.UserID),
+		Time:        event.Time,
+		Message:     event.Text,
+		IsDice:      *event.IsBot,
+		RawMsgID:    event.EventID,
+		CommandInfo: commandInfo,
 	}
 	if *event.IsBot {
 		item.UniformID = fmt.Sprintf("OneBotBridge:bot:%d", event.UserID)
@@ -133,6 +153,80 @@ func (p *PlatformAdapterOnebot) processOnebotBridgeLogEvent(raw []byte, conn *on
 			p.logger.Warn("OneBot bridge log event ACK failed")
 		}
 	}
+}
+
+const onebotBridgeLogDisplayMaxBytes = 16 * 1024
+
+var (
+	onebotBridgeLogOpenIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	onebotBridgeLogTinyIDPattern = regexp.MustCompile(`^[0-9]{1,20}$`)
+)
+
+func parseOnebotBridgeLogDisplay(raw json.RawMessage) *onebotBridgeLogDisplay {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || len(trimmed) > onebotBridgeLogDisplayMaxBytes || trimmed[0] != '{' {
+		return nil
+	}
+	var display onebotBridgeLogDisplay
+	if err := json.Unmarshal(trimmed, &display); err != nil || len(display.AuthorAliases) > 8 || len(display.Mentions) > 64 {
+		return nil
+	}
+	for _, alias := range display.AuthorAliases {
+		if !validOnebotBridgeLogAlias(alias) {
+			return nil
+		}
+	}
+	for mentionIndex := range display.Mentions {
+		mention := &display.Mentions[mentionIndex]
+		if !validOnebotBridgeLogAlias(mention.Target) || len(mention.Aliases) > 8 ||
+			(mention.Name != "" && !validOnebotBridgeLogDisplayName(mention.Name)) {
+			return nil
+		}
+		seen := map[string]struct{}{mention.Target: {}}
+		aliases := make([]string, 0, len(mention.Aliases))
+		for _, alias := range mention.Aliases {
+			if !validOnebotBridgeLogAlias(alias) {
+				return nil
+			}
+			if _, exists := seen[alias]; exists {
+				continue
+			}
+			seen[alias] = struct{}{}
+			aliases = append(aliases, alias)
+			if len(seen) > 8 {
+				return nil
+			}
+		}
+		mention.Aliases = aliases
+	}
+	return &display
+}
+
+func validOnebotBridgeLogAlias(alias string) bool {
+	if len(alias) == 0 || len(alias) > 160 || strings.Count(alias, ":") != 1 {
+		return false
+	}
+	parts := strings.SplitN(alias, ":", 2)
+	switch parts[0] {
+	case "openid":
+		return onebotBridgeLogOpenIDPattern.MatchString(parts[1])
+	case "tinyid":
+		return onebotBridgeLogTinyIDPattern.MatchString(parts[1])
+	default:
+		return false
+	}
+}
+
+func validOnebotBridgeLogDisplayName(name string) bool {
+	if len(name) == 0 || len(name) > 256 || !utf8.ValidString(name) || utf8.RuneCountInString(name) > 80 {
+		return false
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return false
+		}
+	}
+	return true
 }
 
 func validateOnebotBridgeLogEvent(event *onebotBridgeLogEvent) error {
@@ -342,16 +436,18 @@ func onebotBridgeRenderLogSnapshot(operator engine2.DatabaseOperator, groupID, n
 	if !strings.HasPrefix(groupID, "QQ-Group:") {
 		return nil, errors.New("invalid virtual group id")
 	}
-	groupNumber, ok := parseOnebotBridgeVirtualID(strings.TrimPrefix(groupID, "QQ-Group:"))
-	if !ok {
+	if _, ok := parseOnebotBridgeVirtualID(strings.TrimPrefix(groupID, "QQ-Group:")); !ok {
 		return nil, errors.New("invalid virtual group id")
 	}
 	out := &onebotBridgeLimitedBuffer{}
-	if err := onebotBridgeWriteLogHeader(out, strconv.FormatInt(groupNumber, 10), name, format); err != nil {
+	if err := onebotBridgeWriteLogHeader(out, name, format); err != nil {
 		return nil, err
 	}
-	_, err := service.LogCaptureSnapshotWalk(operator, groupID, name, 8, func(page []*model.LogOneItem) error {
-		return onebotBridgeWriteLogItems(out, page, format)
+	writer := newOnebotBridgeLogSnapshotWriter(out, format)
+	_, err := service.LogCaptureSnapshotWalkWithPrepare(operator, groupID, name, 8, func(page []*model.LogOneItem) error {
+		return writer.indexPage(page)
+	}, func(page []*model.LogOneItem) error {
+		return writer.writePage(page)
 	})
 	if err != nil {
 		return nil, err
@@ -377,80 +473,7 @@ func (b *onebotBridgeLimitedBuffer) WriteString(data string) (int, error) {
 	return b.Buffer.WriteString(data)
 }
 
-func onebotBridgeWriteLogHeader(out io.Writer, groupID, name, format string) error {
-	var header strings.Builder
-	if format == "md" {
-		header.WriteString("# ")
-		header.WriteString(onebotBridgeEscapeTitle(name))
-		header.WriteString("\n\n群组虚拟ID：`QQ-Group:")
-		header.WriteString(groupID)
-		header.WriteString("`\n\n")
-	} else {
-		fmt.Fprintf(&header, "日志：%s\n群组虚拟ID：QQ-Group:%s\n\n", name, groupID)
-	}
-	_, err := io.WriteString(out, header.String())
-	return err
-}
-
-func onebotBridgeWriteLogItems(out io.Writer, items []*model.LogOneItem, format string) error {
-	for _, item := range items {
-		if item == nil {
-			continue
-		}
-		if len(item.Message) > onebotBridgeArtifactMaxBytes || len(item.Nickname) > onebotBridgeArtifactMaxBytes || len(item.IMUserID) > onebotBridgeArtifactMaxBytes {
-			return errOnebotBridgeArtifactTooLarge
-		}
-		var row strings.Builder
-		kind := "message"
-		if info, ok := item.CommandInfo.(map[string]interface{}); ok {
-			if value, ok := info["bridgeCaptureKind"].(string); ok && value != "" {
-				kind = value
-			}
-		}
-		timestamp := time.Unix(item.Time, 0).Format("2006-01-02 15:04:05")
-		identity := item.UniformID
-		if identity == "" {
-			identity = item.IMUserID
-		}
-		nickname := item.Nickname
-		if item.IsDice && kind == "gap" {
-			nickname = "SeaDice记录系统"
-		}
-		if kind == "gap" && format == "md" {
-			row.WriteString("**记录缺口**\n")
-		}
-		if format == "md" {
-			color := onebotBridgeMarkdownColor(identity)
-			fmt.Fprintf(&row, "### <span style=\"color:%s\">%s</span> (<code>%s</code>) — %s", color, onebotBridgeEscapeHTMLLine(nickname), html.EscapeString(item.IMUserID), timestamp)
-			if item.IsDice {
-				row.WriteString(" · **bot**")
-			}
-			fmt.Fprintf(&row, "\n\n<pre style=\"white-space:pre-wrap;color:%s\">%s</pre>\n\n", color, html.EscapeString(item.Message))
-		} else {
-			botLabel := "member"
-			if item.IsDice {
-				botLabel = "bot"
-			}
-			fmt.Fprintf(&row, "%s\t%s\tvirtual:%s\t%s\n", timestamp, strings.NewReplacer("\r", " ", "\n", " ").Replace(nickname), item.IMUserID, botLabel)
-			if kind == "gap" {
-				row.WriteString("[记录缺口]\n")
-			}
-			row.WriteString(item.Message)
-			row.WriteString("\n\n")
-		}
-		if _, err := io.WriteString(out, row.String()); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func onebotBridgeEscapeHTMLLine(value string) string {
-	value = html.EscapeString(value)
-	return strings.NewReplacer("\r", "&#13;", "\n", "&#10;").Replace(value)
-}
-
-func onebotBridgeArtifactFilename(groupNumber int64, logName, format string) string {
+func onebotBridgeArtifactFilename(logName, format string) string {
 	var filenamePart strings.Builder
 	characters := 0
 	for _, r := range logName {
@@ -473,5 +496,5 @@ func onebotBridgeArtifactFilename(groupNumber int64, logName, format string) str
 	if clean == "" {
 		clean = "log"
 	}
-	return fmt.Sprintf("group-%d-%s.%s", groupNumber, clean, format)
+	return fmt.Sprintf("%s.%s", clean, format)
 }

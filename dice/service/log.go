@@ -221,6 +221,13 @@ func LogCaptureGapCountByName(operator engine2.DatabaseOperator, groupID, name s
 // The read transaction remains open while visit consumes each page, so later
 // appends and concurrent log deletion cannot produce a mixed export snapshot.
 func LogCaptureSnapshotWalk(operator engine2.DatabaseOperator, groupID, name string, batchSize int, visit func([]*model.LogOneItem) error) (uint64, error) {
+	return LogCaptureSnapshotWalkWithPrepare(operator, groupID, name, batchSize, nil, visit)
+}
+
+// LogCaptureSnapshotWalkWithPrepare performs an optional index pass and a
+// rendering pass over one fixed log snapshot in the same read transaction.
+// The prepare visitor must retain only bounded derived metadata, not page data.
+func LogCaptureSnapshotWalkWithPrepare(operator engine2.DatabaseOperator, groupID, name string, batchSize int, prepare, visit func([]*model.LogOneItem) error) (uint64, error) {
 	if operator == nil || groupID == "" || name == "" || batchSize < 1 || batchSize > 256 || visit == nil {
 		return 0, errors.New("invalid OneBot bridge log snapshot request")
 	}
@@ -234,27 +241,35 @@ func LogCaptureSnapshotWalk(operator engine2.DatabaseOperator, groupID, name str
 		if err := tx.Model(&model.LogOneItem{}).Where("log_id = ?", logID).Select("COALESCE(MAX(id), 0)").Scan(&cutoff).Error; err != nil {
 			return err
 		}
-		var afterID uint64
-		for afterID < cutoff {
-			var page []*model.LogOneItem
-			if err := tx.Model(&model.LogOneItem{}).
-				Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
-				Where("log_id = ? AND id > ? AND id <= ?", logID, afterID, cutoff).
-				Order("id ASC").Limit(batchSize).Find(&page).Error; err != nil {
+		walk := func(visitor func([]*model.LogOneItem) error) error {
+			var afterID uint64
+			for afterID < cutoff {
+				var page []*model.LogOneItem
+				if err := tx.Model(&model.LogOneItem{}).
+					Select("id, nickname, im_userid, time, message, is_dice, command_id, command_info, raw_msg_id, user_uniform_id").
+					Where("log_id = ? AND id > ? AND id <= ?", logID, afterID, cutoff).
+					Order("id ASC").Limit(batchSize).Find(&page).Error; err != nil {
+					return err
+				}
+				if len(page) == 0 {
+					break
+				}
+				if err := visitor(page); err != nil {
+					return err
+				}
+				afterID = page[len(page)-1].ID
+				if len(page) < batchSize {
+					break
+				}
+			}
+			return nil
+		}
+		if prepare != nil {
+			if err := walk(prepare); err != nil {
 				return err
-			}
-			if len(page) == 0 {
-				break
-			}
-			if err := visit(page); err != nil {
-				return err
-			}
-			afterID = page[len(page)-1].ID
-			if len(page) < batchSize {
-				break
 			}
 		}
-		return nil
+		return walk(visit)
 	})
 	return cutoff, err
 }

@@ -347,14 +347,18 @@ func onebotBridgeEmitLogArtifact(ctx *MsgContext, msg *Message, state model.Oneb
 	if ctx == nil || ctx.Dice == nil || ctx.LLMBridgeRequest == nil || state.Name == "" || state.LogID == 0 {
 		return false
 	}
-	groupNumber, ok := parseOnebotBridgeVirtualID(strings.TrimPrefix(state.GroupID, "QQ-Group:"))
+	_, ok := parseOnebotBridgeVirtualID(strings.TrimPrefix(state.GroupID, "QQ-Group:"))
 	if !strings.HasPrefix(state.GroupID, "QQ-Group:") || !ok {
 		ctx.LLMBridgeRequest.markFailedAt("log_group_id_invalid")
 		return false
 	}
 	data, err := onebotBridgeRenderLogSnapshot(ctx.Dice.DBOperator, state.GroupID, state.Name, format)
 	if err != nil {
-		onebotBridgeLogReply(ctx, msg, false, "日志导出失败：超出10 MiB限制或快照读取失败")
+		if errors.Is(err, errOnebotBridgeLogDisplayIndexTooLarge) {
+			onebotBridgeLogReply(ctx, msg, false, "日志导出失败：成员索引超过 10000 个，请拆分日志后重试")
+		} else {
+			onebotBridgeLogReply(ctx, msg, false, "日志导出失败：超出10 MiB限制或快照读取失败")
+		}
 		return false
 	}
 	ext := format
@@ -362,7 +366,7 @@ func onebotBridgeEmitLogArtifact(ctx *MsgContext, msg *Message, state model.Oneb
 	if format == "txt" {
 		mediaType = "text/plain"
 	}
-	filename := onebotBridgeArtifactFilename(groupNumber, state.Name, ext)
+	filename := onebotBridgeArtifactFilename(state.Name, ext)
 	if err := ctx.LLMBridgeRequest.emitArtifact(filename, mediaType, data); err != nil {
 		ctx.LLMBridgeRequest.markFailedAt("log_artifact_rejected")
 		return false

@@ -43,17 +43,18 @@ type onebotBridgeCapturedAction struct {
 type onebotBridgeCaptureEmitter struct {
 	emitter.Emitter
 
-	mu            sync.Mutex
-	sends         []onebotBridgeCapturedSend
-	completions   []onebotBridgeCapturedCompletion
-	registrations []onebotBridgeRegisterParams
-	actions       []onebotBridgeCapturedAction
-	sendErr       error
-	rawActionErr  error
-	rawActionName emitter.Action
-	sendStarted   chan struct{}
-	releaseSend   chan struct{}
-	completeCh    chan onebotBridgeCompleteParams
+	mu                   sync.Mutex
+	sends                []onebotBridgeCapturedSend
+	completions          []onebotBridgeCapturedCompletion
+	registrations        []onebotBridgeRegisterParams
+	registerCapabilities []string
+	actions              []onebotBridgeCapturedAction
+	sendErr              error
+	rawActionErr         error
+	rawActionName        emitter.Action
+	sendStarted          chan struct{}
+	releaseSend          chan struct{}
+	completeCh           chan onebotBridgeCompleteParams
 }
 
 var _ emitter.Emitter = (*onebotBridgeCaptureEmitter)(nil)
@@ -101,7 +102,14 @@ func (e *onebotBridgeCaptureEmitter) Raw(_ context.Context, action emitter.Actio
 		e.mu.Lock()
 		e.registrations = append(e.registrations, registration)
 		e.mu.Unlock()
-		return []byte(`{"status":"ok","retcode":0,"data":{"version":1,"connection_id":"registered-connection"}}`), nil
+		resultData, err := json.Marshal(map[string]any{
+			"version": 1, "connection_id": "registered-connection", "capabilities": e.registerCapabilities,
+		})
+		if err != nil {
+			return nil, err
+		}
+		response, err := json.Marshal(map[string]any{"status": "ok", "retcode": 0, "data": json.RawMessage(resultData)})
+		return response, err
 	}
 	if action == onebotLLMBridgeLogAckAction || action == onebotLLMBridgeArtifactAction {
 		encoded, err := json.Marshal(params)
@@ -168,7 +176,7 @@ func newOnebotBridgeTestTracker(t *testing.T, p *PlatformAdapterOnebot, em *oneb
 }
 
 func TestOnebotBridgeRegistrationAdvertisesGroupRoleCapability(t *testing.T) {
-	em := &onebotBridgeCaptureEmitter{}
+	em := &onebotBridgeCaptureEmitter{registerCapabilities: []string{"log-display-v1"}}
 	conn := &onebotBridgeConnection{emitter: em, ctx: context.Background(), registerDone: make(chan struct{})}
 	adapter := &PlatformAdapterOnebot{LLMBridgeEnabled: true, logger: zap.NewNop().Sugar()}
 	if err := adapter.registerLLMBridgeConnection(conn); err != nil {
@@ -179,12 +187,25 @@ func TestOnebotBridgeRegistrationAdvertisesGroupRoleCapability(t *testing.T) {
 	if len(em.registrations) != 1 {
 		t.Fatalf("registration count = %d, want 1", len(em.registrations))
 	}
-	for _, capability := range em.registrations[0].Capabilities {
-		if capability == "group-role-v1" {
-			return
+	for _, wanted := range []string{"group-role-v1", "log-display-v1"} {
+		found := false
+		for _, capability := range em.registrations[0].Capabilities {
+			if capability == wanted {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("registration capabilities = %v, missing %s", em.registrations[0].Capabilities, wanted)
 		}
 	}
-	t.Fatalf("registration capabilities = %v, missing group-role-v1", em.registrations[0].Capabilities)
+	if !conn.hasLogDisplayCapability("registered-connection") {
+		t.Fatal("negotiated log-display-v1 was not bound to the current connection")
+	}
+	conn.setRegistration("replacement-connection", true)
+	if conn.hasLogDisplayCapability("replacement-connection") {
+		t.Fatal("log-display-v1 leaked across a connection change")
+	}
 }
 
 func TestOnebotBridgeRequestTrackerCapturesOnlyStandardGroupRoles(t *testing.T) {
