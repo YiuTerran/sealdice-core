@@ -29,7 +29,6 @@ var (
 type onebotBridgeLogAuthor struct {
 	identity string
 	name     string
-	isBot    bool
 }
 
 type onebotBridgeLogMentionToken struct {
@@ -48,25 +47,33 @@ type onebotBridgeLogSnapshotWriter struct {
 	aliasClaims         map[string]map[string]struct{}
 	componentClaims     map[string]map[string]struct{}
 	mentionedAliases    map[string]struct{}
+	botEvidenceAliases  map[string]struct{}
+	humanAuthorAliases  map[string]struct{}
+	botEvidenceRoots    map[string]struct{}
 	identities          map[string]struct{}
 	extraTargets        map[string]struct{}
 	anonymous           map[string]string
+	knownBotAliasRoots  map[string]struct{}
 	nextMember          int
 	aliasIndexFinalized bool
 }
 
 func newOnebotBridgeLogSnapshotWriter(out io.Writer, format string) *onebotBridgeLogSnapshotWriter {
 	return &onebotBridgeLogSnapshotWriter{
-		out:              out,
-		format:           format,
-		authors:          make(map[string]onebotBridgeLogAuthor),
-		aliasParent:      make(map[string]string),
-		aliasClaims:      make(map[string]map[string]struct{}),
-		componentClaims:  make(map[string]map[string]struct{}),
-		mentionedAliases: make(map[string]struct{}),
-		identities:       make(map[string]struct{}),
-		extraTargets:     make(map[string]struct{}),
-		anonymous:        make(map[string]string),
+		out:                out,
+		format:             format,
+		authors:            make(map[string]onebotBridgeLogAuthor),
+		aliasParent:        make(map[string]string),
+		aliasClaims:        make(map[string]map[string]struct{}),
+		componentClaims:    make(map[string]map[string]struct{}),
+		mentionedAliases:   make(map[string]struct{}),
+		botEvidenceAliases: make(map[string]struct{}),
+		humanAuthorAliases: make(map[string]struct{}),
+		botEvidenceRoots:   make(map[string]struct{}),
+		identities:         make(map[string]struct{}),
+		extraTargets:       make(map[string]struct{}),
+		anonymous:          make(map[string]string),
+		knownBotAliasRoots: make(map[string]struct{}),
 	}
 }
 
@@ -86,12 +93,11 @@ func (w *onebotBridgeLogSnapshotWriter) indexPage(items []*model.LogOneItem) err
 		name := onebotBridgeSafeSpeakerName(item, display)
 		author, exists := w.authors[identity]
 		if !exists {
-			author = onebotBridgeLogAuthor{identity: identity, isBot: item.IsDice}
+			author = onebotBridgeLogAuthor{identity: identity}
 		}
 		if name != "" {
 			author.name = name
 		}
-		author.isBot = author.isBot || item.IsDice
 		w.authors[identity] = author
 		if display == nil {
 			continue
@@ -106,11 +112,21 @@ func (w *onebotBridgeLogSnapshotWriter) indexPage(items []*model.LogOneItem) err
 				w.aliasClaims[alias] = claims
 			}
 			claims[identity] = struct{}{}
+			if item.IsDice {
+				w.botEvidenceAliases[alias] = struct{}{}
+			} else {
+				w.humanAuthorAliases[alias] = struct{}{}
+			}
 		}
 		for _, mention := range display.Mentions {
 			aliases := append([]string{mention.Target}, mention.Aliases...)
 			if err := w.linkAliasGroup(aliases, true); err != nil {
 				return err
+			}
+			if mention.IsBot {
+				for _, alias := range aliases {
+					w.botEvidenceAliases[alias] = struct{}{}
+				}
 			}
 		}
 	}
@@ -167,11 +183,11 @@ func (w *onebotBridgeLogSnapshotWriter) writePage(items []*model.LogOneItem) err
 			if item.IsDice {
 				row.WriteString(" · **bot**")
 			}
-			body, err := w.renderMarkdownBody(item.Message, itemDisplay)
+			body, err := w.renderMarkdownBody(item.Message, itemDisplay, color)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(&row, "\n\n<pre style=\"white-space:pre-wrap;color:%s\">%s</pre>\n\n", color, body)
+			fmt.Fprintf(&row, "\n\n%s\n\n", body)
 		} else {
 			botLabel := "member"
 			if item.IsDice {
@@ -390,6 +406,21 @@ func (w *onebotBridgeLogSnapshotWriter) finalizeAliasIndex() error {
 			component[identity] = struct{}{}
 		}
 	}
+	w.botEvidenceRoots = make(map[string]struct{})
+	for alias := range w.botEvidenceAliases {
+		w.botEvidenceRoots[w.findAlias(alias)] = struct{}{}
+	}
+	humanAuthorRoots := make(map[string]struct{}, len(w.humanAuthorAliases))
+	for alias := range w.humanAuthorAliases {
+		humanAuthorRoots[w.findAlias(alias)] = struct{}{}
+	}
+	w.knownBotAliasRoots = make(map[string]struct{})
+	for root := range w.botEvidenceRoots {
+		_, hasHumanAuthor := humanAuthorRoots[root]
+		if len(w.componentClaims[root]) <= 1 && !hasHumanAuthor {
+			w.knownBotAliasRoots[root] = struct{}{}
+		}
+	}
 	for alias := range w.mentionedAliases {
 		root := w.findAlias(alias)
 		if len(w.componentClaims[root]) == 0 {
@@ -440,27 +471,105 @@ func (w *onebotBridgeLogSnapshotWriter) anonymousLabel(identity string, countTar
 	return label, nil
 }
 
-func (w *onebotBridgeLogSnapshotWriter) renderMarkdownBody(text string, display *onebotBridgeLogDisplay) (string, error) {
+func (w *onebotBridgeLogSnapshotWriter) renderMarkdownBody(text string, display *onebotBridgeLogDisplay, color string) (string, error) {
+	out := &onebotBridgeLimitedBuffer{}
+	if _, err := out.WriteString("<div>"); err != nil {
+		return "", err
+	}
+	writeLine := func(line string, index int) error {
+		if index > 0 {
+			if _, err := out.WriteString("<br />"); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(out, "<span style=\"white-space:pre-wrap;color:%s\">", color); err != nil {
+			return err
+		}
+		if err := w.renderMarkdownLine(out, line, display); err != nil {
+			return err
+		}
+		_, err := out.WriteString("</span>")
+		return err
+	}
+	lineStart := 0
+	lineIndex := 0
+	for index := 0; index < len(text); index++ {
+		if text[index] != '\r' && text[index] != '\n' {
+			continue
+		}
+		if err := writeLine(text[lineStart:index], lineIndex); err != nil {
+			return "", err
+		}
+		lineIndex++
+		if text[index] == '\r' && index+1 < len(text) && text[index+1] == '\n' {
+			index++
+		}
+		lineStart = index + 1
+	}
+	if err := writeLine(text[lineStart:], lineIndex); err != nil {
+		return "", err
+	}
+	if _, err := out.WriteString("</div>"); err != nil {
+		return "", err
+	}
+	return out.String(), nil
+}
+
+func (w *onebotBridgeLogSnapshotWriter) renderMarkdownLine(out io.StringWriter, text string, display *onebotBridgeLogDisplay) error {
 	tokens := onebotBridgeParseMentionTokens(text)
 	if len(tokens) == 0 {
-		return html.EscapeString(text), nil
+		return onebotBridgeWriteEscapedHTML(out, text)
 	}
-	var out strings.Builder
 	last := 0
 	for _, token := range tokens {
 		if token.start < last || token.end > len(text) {
 			continue
 		}
-		out.WriteString(html.EscapeString(text[last:token.start]))
+		if err := onebotBridgeWriteEscapedHTML(out, text[last:token.start]); err != nil {
+			return err
+		}
 		name, err := w.resolveMention(token, display)
 		if err != nil {
-			return "", err
+			return err
 		}
-		out.WriteString(html.EscapeString("@" + name))
+		if err := onebotBridgeWriteEscapedHTML(out, "@"+name); err != nil {
+			return err
+		}
 		last = token.end
 	}
-	out.WriteString(html.EscapeString(text[last:]))
-	return out.String(), nil
+	return onebotBridgeWriteEscapedHTML(out, text[last:])
+}
+
+func onebotBridgeWriteEscapedHTML(out io.StringWriter, value string) error {
+	start := 0
+	for index := 0; index < len(value); index++ {
+		var entity string
+		switch value[index] {
+		case '&':
+			entity = "&amp;"
+		case '<':
+			entity = "&lt;"
+		case '>':
+			entity = "&gt;"
+		case '"':
+			entity = "&#34;"
+		case '\'':
+			entity = "&#39;"
+		case '\r':
+			entity = "&#13;"
+		default:
+			continue
+		}
+		if _, err := out.WriteString(value[start:index]); err != nil {
+			return err
+		}
+		if _, err := out.WriteString(entity); err != nil {
+			return err
+		}
+		start = index + 1
+	}
+	_, err := out.WriteString(value[start:])
+	return err
 }
 
 func (w *onebotBridgeLogSnapshotWriter) resolveMention(token onebotBridgeLogMentionToken, display *onebotBridgeLogDisplay) (string, error) {
@@ -474,10 +583,22 @@ func (w *onebotBridgeLogSnapshotWriter) resolveMention(token onebotBridgeLogMent
 		currentAliases = append(currentAliases, current.Aliases...)
 	}
 	ambiguous := w.aliasesHaveConflictingAuthors(currentAliases)
-	if !ambiguous && current != nil {
-		if current.IsBot {
-			return "机器人", nil
+	root := ""
+	if len(currentAliases) > 0 {
+		root = w.findAlias(currentAliases[0])
+	}
+	if root != "" {
+		if _, hasBotEvidence := w.botEvidenceRoots[root]; hasBotEvidence {
+			if _, confirmedBot := w.knownBotAliasRoots[root]; confirmedBot {
+				return "机器人", nil
+			}
+			return w.anonymousTarget(root)
 		}
+	}
+	if !ambiguous && current != nil && current.IsBot {
+		return "机器人", nil
+	}
+	if !ambiguous && current != nil {
 		if name := onebotBridgeUsableLogName(current.Name); name != "" && !onebotBridgeNameIsIdentity(name, currentAliases) {
 			return strings.TrimPrefix(name, "@"), nil
 		}
@@ -492,9 +613,6 @@ func (w *onebotBridgeLogSnapshotWriter) resolveMention(token onebotBridgeLogMent
 	}
 	identityLabel := ""
 	if author, ok := w.authorForAliases(authorAliases); ok {
-		if author.isBot {
-			return "机器人", nil
-		}
 		if author.name != "" && !onebotBridgeNameIsIdentity(author.name, authorAliases) {
 			return strings.TrimPrefix(author.name, "@"), nil
 		}
@@ -513,13 +631,13 @@ func (w *onebotBridgeLogSnapshotWriter) resolveMention(token onebotBridgeLogMent
 	if len(canonicalAliases) > 0 {
 		identity = w.findAlias(canonicalAliases[0])
 	}
-	identityKey := "target:" + identity
-	countTarget := len(w.componentClaims[identity]) == 0
-	label, err := w.anonymousLabel(identityKey, countTarget)
-	if err != nil {
-		return "", err
-	}
-	return label, nil
+	return w.anonymousTarget(identity)
+}
+
+func (w *onebotBridgeLogSnapshotWriter) anonymousTarget(root string) (string, error) {
+	identityKey := "target:" + root
+	countTarget := len(w.componentClaims[root]) == 0
+	return w.anonymousLabel(identityKey, countTarget)
 }
 
 func (w *onebotBridgeLogSnapshotWriter) aliasesHaveConflictingAuthors(aliases []string) bool {

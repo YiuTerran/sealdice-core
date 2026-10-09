@@ -104,9 +104,9 @@ func TestOnebotBridgeCaptureFrameIngressACKDedupAndSafeRendering(t *testing.T) {
 	if !strings.Contains(string(markdown), `style="color:#`) || !strings.Contains(string(markdown), "&lt;script&gt;secret&lt;/script&gt;") || strings.Contains(string(markdown), "<script>") {
 		t.Fatalf("Markdown renderer failed stable color or escaped body: %s", markdown)
 	}
-	pre := regexp.MustCompile(`(?s)<pre style="[^"]+">(.*?)</pre>`).FindStringSubmatch(string(markdown))
-	if len(pre) != 2 || html.UnescapeString(pre[1]) != "hello <script>secret</script>" {
-		t.Fatalf("Markdown pre content did not round-trip raw text: %#v", pre)
+	bodies := onebotBridgeMarkdownRenderedBodies(t, markdown)
+	if len(bodies) != 1 || bodies[0] != "hello <script>secret</script>" {
+		t.Fatalf("Markdown body did not round-trip raw text: %#v", bodies)
 	}
 	plainText, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "capture", "txt")
 	if err != nil || !strings.Contains(string(plainText), "hello <script>secret</script>") {
@@ -117,6 +117,192 @@ func TestOnebotBridgeCaptureFrameIngressACKDedupAndSafeRendering(t *testing.T) {
 			t.Fatalf("capture diagnostics leaked body text: %#v", entry)
 		}
 	}
+}
+
+func TestOnebotBridgeMarkdownBodyUsesSingleLineSpansAndPreservesText(t *testing.T) {
+	d, _, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	logDB := d.DBOperator.GetLogDB(constant.WRITE)
+	if err := logDB.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}, &model.OnebotBridgeLogEvent{}, &model.OnebotBridgeLogState{}); err != nil {
+		t.Fatal(err)
+	}
+	const groupID = "QQ-Group:8000000000000119"
+	if _, err := service.OnebotBridgeLogNew(d.DBOperator, groupID, "multiline"); err != nil {
+		t.Fatal(err)
+	}
+	message := strings.Join([]string{
+		"first line",
+		"",
+		"- list item",
+		"|left|right|",
+		"|---|---|",
+		"`code` with\ttab",
+		"<script>alert('x')</script>",
+		"last line\r",
+		"bare\rseparator",
+		"",
+	}, "\n")
+	item := &model.LogOneItem{
+		Nickname: "Member", IMUserID: "8000000000000120", UniformID: "OneBotBridge:QQ:8000000000000120",
+		Time: 1710000301, Message: message, CommandInfo: map[string]interface{}{"bridgeCaptureKind": "message"},
+	}
+	if _, _, err := service.LogCaptureAppend(d.DBOperator, "multiline-event-1", groupID, "message", item); err != nil {
+		t.Fatal(err)
+	}
+	markdown, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "multiline", "md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	div := regexp.MustCompile(`<div>(.*?)</div>`).FindStringSubmatch(string(markdown))
+	if len(div) != 2 || strings.Contains(div[1], "<script>") || !strings.Contains(div[1], "&lt;script&gt;") {
+		t.Fatalf("Markdown body was not a single escaped HTML line: %#v", div)
+	}
+	if strings.ContainsAny(div[1], "\r\n") {
+		t.Fatalf("Markdown body contains a physical source newline: %q", div[1])
+	}
+	spanCount := strings.Count(div[1], `<span style="white-space:pre-wrap;color:`)
+	wantMarkdownBody := strings.ReplaceAll(strings.ReplaceAll(message, "\r\n", "\n"), "\r", "\n")
+	wantSpanCount := strings.Count(wantMarkdownBody, "\n") + 1
+	if spanCount != wantSpanCount {
+		t.Fatalf("body span count = %d, want one span for each of %d displayed lines: %s", spanCount, wantSpanCount, div[1])
+	}
+	if strings.Count(div[1], "<br />") != spanCount-1 {
+		t.Fatalf("body has an unexpected number of line breaks: %s", div[1])
+	}
+	bodies := onebotBridgeMarkdownRenderedBodies(t, markdown)
+	if len(bodies) != 1 || bodies[0] != wantMarkdownBody {
+		t.Fatalf("Markdown body did not preserve displayed lines, blanks, tabs, or text: got=%q want=%q", bodies, wantMarkdownBody)
+	}
+	plain, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "multiline", "txt")
+	if err != nil || !strings.Contains(string(plain), message+"\n\n") {
+		t.Fatalf("TXT renderer changed raw multiline body: err=%v output=%q", err, plain)
+	}
+}
+
+func TestOnebotBridgeMarkdownMarkupExpansionIsBounded(t *testing.T) {
+	d, _, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	logDB := d.DBOperator.GetLogDB(constant.WRITE)
+	if err := logDB.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}, &model.OnebotBridgeLogEvent{}, &model.OnebotBridgeLogState{}); err != nil {
+		t.Fatal(err)
+	}
+	const groupID = "QQ-Group:8000000000000129"
+	if _, err := service.OnebotBridgeLogNew(d.DBOperator, groupID, "markup-limit"); err != nil {
+		t.Fatal(err)
+	}
+	message := strings.Repeat("\n", 200_000)
+	item := &model.LogOneItem{
+		Nickname: "Member", IMUserID: "8000000000000130", UniformID: "OneBotBridge:QQ:8000000000000130",
+		Time: 1710000351, Message: message, CommandInfo: map[string]interface{}{"bridgeCaptureKind": "message"},
+	}
+	if _, _, err := service.LogCaptureAppend(d.DBOperator, "markup-limit-event", groupID, "message", item); err != nil {
+		t.Fatal(err)
+	}
+	markdown, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "markup-limit", "md")
+	if !errors.Is(err, errOnebotBridgeArtifactTooLarge) || markdown != nil {
+		t.Fatalf("oversized markup was not rejected without a partial artifact: len=%d err=%v", len(markdown), err)
+	}
+}
+
+func TestOnebotBridgeSnapshotUsesLaterBotAliasesOnlyWhenUncontested(t *testing.T) {
+	d, _, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	logDB := d.DBOperator.GetLogDB(constant.WRITE)
+	if err := logDB.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}, &model.OnebotBridgeLogEvent{}, &model.OnebotBridgeLogState{}); err != nil {
+		t.Fatal(err)
+	}
+	const groupID = "QQ-Group:8000000000000141"
+	if _, err := service.OnebotBridgeLogNew(d.DBOperator, groupID, "legacy"); err != nil {
+		t.Fatal(err)
+	}
+	appendItem := func(logName, eventID string, userID int64, nickname, message string, isBot bool, display *onebotBridgeLogDisplay) {
+		t.Helper()
+		commandInfo := map[string]interface{}{"bridgeCaptureKind": "message"}
+		if display != nil {
+			commandInfo["bridgeDisplay"] = display
+		}
+		item := &model.LogOneItem{
+			Nickname: nickname, IMUserID: strconv.FormatInt(userID, 10), UniformID: fmt.Sprintf("OneBotBridge:QQ:%d", userID),
+			Time: 1710000400 + userID%100, Message: message, IsDice: isBot, CommandInfo: commandInfo,
+		}
+		if _, _, err := service.LogCaptureAppend(d.DBOperator, eventID, groupID, "message", item); err != nil {
+			t.Fatalf("append %s row %q: %v", logName, eventID, err)
+		}
+	}
+	oldBody := "historical [@Ignored Label](mqqapi://markdown/mention?at_type=1&at_tinyid=123) <@legacy-openid> unrelated <@unrelated> nickname <@nickname-only> contested <@claimed> shared <@multi> cross <@cross-bot>"
+	appendItem("legacy", "legacy-old", 8000000142, "Legacy speaker", oldBody, false, nil)
+	appendItem("legacy", "legacy-nickname", 8000000143, "机器人", "nickname only", false, nil)
+	appendItem("legacy", "legacy-bot-metadata", 8000000144, "Recorder", "later SDK evidence",
+		false, &onebotBridgeLogDisplay{
+			AuthorAliases: []string{"openid:recorder"},
+			Mentions: []onebotBridgeLogMention{
+				{Target: "tinyid:123", Aliases: []string{"openid:legacy-openid"}, IsBot: true},
+				{Target: "tinyid:456", Aliases: []string{"openid:unrelated"}, Name: "Unrelated SDK name"},
+			},
+		})
+	appendItem("legacy", "legacy-human-claim", 8000000145, "Human claimant", "current <@claimed>", false,
+		&onebotBridgeLogDisplay{
+			AuthorAliases: []string{"openid:claimed"},
+			Mentions:      []onebotBridgeLogMention{{Target: "tinyid:901", Aliases: []string{"openid:claimed"}, IsBot: true}},
+		})
+	appendItem("legacy", "legacy-first-multi-claim", 8000000146, "First claimant", "first claim", false,
+		&onebotBridgeLogDisplay{AuthorAliases: []string{"openid:multi"}})
+	appendItem("legacy", "legacy-second-multi-claim", 8000000147, "Second claimant", "second claim", false,
+		&onebotBridgeLogDisplay{AuthorAliases: []string{"openid:multi"}})
+	appendItem("legacy", "legacy-multi-bot-evidence", 8000000148, "Recorder two", "conflicting bot evidence", false,
+		&onebotBridgeLogDisplay{
+			AuthorAliases: []string{"openid:recorder-two"},
+			Mentions:      []onebotBridgeLogMention{{Target: "tinyid:902", Aliases: []string{"openid:multi"}, IsBot: true}},
+		})
+	if _, err := service.OnebotBridgeLogNew(d.DBOperator, groupID, "other"); err != nil {
+		t.Fatal(err)
+	}
+	appendItem("other", "other-bot-metadata", 8000000149, "Other recorder", "other log evidence", false,
+		&onebotBridgeLogDisplay{
+			AuthorAliases: []string{"openid:other-recorder"},
+			Mentions:      []onebotBridgeLogMention{{Target: "tinyid:777", Aliases: []string{"openid:cross-bot"}, IsBot: true}},
+		})
+
+	markdown, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "legacy", "md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodies := onebotBridgeMarkdownRenderedBodies(t, markdown)
+	if len(bodies) != 7 {
+		t.Fatalf("rendered %d bodies, want 7: %#v", len(bodies), bodies)
+	}
+	wantOldBody := "historical @机器人 @机器人 unrelated @成员1 nickname @成员2 contested @成员3 shared @成员4 cross @成员5"
+	if bodies[0] != wantOldBody {
+		t.Fatalf("legacy mention resolution = %q, want %q", bodies[0], wantOldBody)
+	}
+	if strings.Contains(bodies[3], "@机器人") || !strings.Contains(bodies[3], "@成员") {
+		t.Fatalf("human-claimed current-row alias did not fail closed anonymously: %q", bodies[3])
+	}
+}
+
+func onebotBridgeMarkdownRenderedBodies(t *testing.T, markdown []byte) []string {
+	t.Helper()
+	divs := regexp.MustCompile(`<div>(.*?)</div>`).FindAllStringSubmatch(string(markdown), -1)
+	spanPattern := regexp.MustCompile(`<span style="white-space:pre-wrap;color:#[0-9a-f]{6}">(.*?)</span>`)
+	bodies := make([]string, 0, len(divs))
+	for _, div := range divs {
+		if len(div) != 2 {
+			t.Fatalf("malformed Markdown body div: %#v", div)
+		}
+		spans := spanPattern.FindAllStringSubmatch(div[1], -1)
+		if len(spans) == 0 || strings.Count(div[1], "<br />") != len(spans)-1 {
+			t.Fatalf("body does not have one colored span per line: %s", div[1])
+		}
+		var body strings.Builder
+		for index, span := range spans {
+			if index > 0 {
+				body.WriteByte('\n')
+			}
+			body.WriteString(html.UnescapeString(span[1]))
+		}
+		bodies = append(bodies, body.String())
+	}
+	return bodies
 }
 
 func TestOnebotBridgeLogDisplayMetadataRendersNamesWithoutVirtualIDs(t *testing.T) {
@@ -222,7 +408,7 @@ func TestOnebotBridgeLogDisplayMetadataRendersNamesWithoutVirtualIDs(t *testing.
 			t.Fatalf("Markdown leaked internal identity %q: %s", internal, text)
 		}
 	}
-	for _, want := range []string{"@SDK &lt;Current&gt;", "@Inline", "@Friend &lt;Name&gt;", "@机器人", "@成员1", "@成员2", "@Literal", "成员3", "Author &amp; One"} {
+	for _, want := range []string{"@SDK &lt;Current&gt;", "@Inline", "@Friend &lt;Name&gt;", "@机器人", "@成员1", "@成员2", "成员3", "Author &amp; One"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("Markdown missing %q: %s", want, text)
 		}
