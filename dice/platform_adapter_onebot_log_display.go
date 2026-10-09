@@ -82,6 +82,9 @@ func (w *onebotBridgeLogSnapshotWriter) indexPage(items []*model.LogOneItem) err
 		if item == nil {
 			continue
 		}
+		if onebotBridgeItemKind(item) == "gap" {
+			continue
+		}
 		identity := onebotBridgeLogIdentity(item)
 		if _, exists := w.identities[identity]; !exists {
 			if len(w.identities) >= onebotBridgeLogDisplayMaxIdentities {
@@ -144,10 +147,13 @@ func (w *onebotBridgeLogSnapshotWriter) writePage(items []*model.LogOneItem) err
 		if item == nil {
 			continue
 		}
+		kind := onebotBridgeItemKind(item)
+		if kind == "gap" {
+			continue
+		}
 		if len(item.Message) > onebotBridgeArtifactMaxBytes || len(item.Nickname) > onebotBridgeArtifactMaxBytes || len(item.IMUserID) > onebotBridgeArtifactMaxBytes {
 			return errOnebotBridgeArtifactTooLarge
 		}
-		kind := onebotBridgeItemKind(item)
 		timestamp := time.Unix(item.Time, 0).Format("2006-01-02 15:04:05")
 		identity := item.UniformID
 		if identity == "" {
@@ -161,10 +167,8 @@ func (w *onebotBridgeLogSnapshotWriter) writePage(items []*model.LogOneItem) err
 			}
 		}
 		if nickname == "" {
-			if item.IsDice && kind != "gap" {
+			if item.IsDice {
 				nickname = "机器人"
-			} else if kind == "gap" {
-				nickname = "SeaDice记录系统"
 			} else {
 				label, err := w.anonymousLabel("identity:"+onebotBridgeLogIdentity(item), false)
 				if err != nil {
@@ -174,9 +178,6 @@ func (w *onebotBridgeLogSnapshotWriter) writePage(items []*model.LogOneItem) err
 			}
 		}
 		var row strings.Builder
-		if kind == "gap" && w.format == "md" {
-			row.WriteString("**记录缺口**\n")
-		}
 		if w.format == "md" {
 			color := onebotBridgeMarkdownColor(identity)
 			fmt.Fprintf(&row, "### <span style=\"color:%s\">%s</span> — %s", color, onebotBridgeEscapeHTMLLine(nickname), timestamp)
@@ -185,7 +186,7 @@ func (w *onebotBridgeLogSnapshotWriter) writePage(items []*model.LogOneItem) err
 			}
 			var body string
 			var err error
-			if item.IsDice && kind != "gap" {
+			if item.IsDice {
 				body, err = w.renderBotMarkdownBody(item.Message, itemDisplay)
 			} else {
 				body, err = w.renderMarkdownBody(item.Message, itemDisplay, color)
@@ -200,9 +201,6 @@ func (w *onebotBridgeLogSnapshotWriter) writePage(items []*model.LogOneItem) err
 				botLabel = "bot"
 			}
 			fmt.Fprintf(&row, "%s\t%s\t%s\n", timestamp, strings.NewReplacer("\r", " ", "\n", " ").Replace(nickname), botLabel)
-			if kind == "gap" {
-				row.WriteString("[记录缺口]\n")
-			}
 			row.WriteString(item.Message)
 			row.WriteString("\n\n")
 		}

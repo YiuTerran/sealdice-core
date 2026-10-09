@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -402,6 +403,156 @@ func TestOnebotBridgeSnapshotUsesLaterBotAliasesOnlyWhenUncontested(t *testing.T
 	}
 	if strings.Contains(bodies[3], "@机器人") || !strings.Contains(bodies[3], "@成员") {
 		t.Fatalf("human-claimed current-row alias did not fail closed anonymously: %q", bodies[3])
+	}
+}
+
+func TestOnebotBridgeLogExportsHideGapRowsAndTheirMetadata(t *testing.T) {
+	d, _, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	logDB := d.DBOperator.GetLogDB(constant.WRITE)
+	if err := logDB.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}, &model.OnebotBridgeLogEvent{}, &model.OnebotBridgeLogState{}); err != nil {
+		t.Fatal(err)
+	}
+	const groupID = "QQ-Group:8000000000000161"
+	if _, err := service.OnebotBridgeLogNew(d.DBOperator, groupID, "mixed-gaps"); err != nil {
+		t.Fatal(err)
+	}
+	appendRow := func(eventID, logName, kind string, item *model.LogOneItem) {
+		t.Helper()
+		if _, _, err := service.LogCaptureAppend(d.DBOperator, eventID, groupID, kind, item); err != nil {
+			t.Fatalf("append %s row %q: %v", kind, eventID, err)
+		}
+	}
+	makeItem := func(userID, nickname, message string, isBot bool, kind string, display *onebotBridgeLogDisplay) *model.LogOneItem {
+		commandInfo := map[string]interface{}{"bridgeCaptureKind": kind}
+		if display != nil {
+			commandInfo["bridgeDisplay"] = display
+		}
+		return &model.LogOneItem{
+			Nickname: nickname, IMUserID: userID, UniformID: "OneBotBridge:QQ:" + userID,
+			Time: 1710000500, Message: message, IsDice: isBot, CommandInfo: commandInfo,
+		}
+	}
+	// This gap deliberately claims the later human's alias and a bot mention.
+	// Neither its nickname nor those synthetic aliases belong in exported chat.
+	gapDisplay := &onebotBridgeLogDisplay{
+		AuthorAliases: []string{"openid:shared-human"},
+		Mentions:      []onebotBridgeLogMention{{Target: "openid:999", Name: "gap bot", IsBot: true}},
+	}
+	appendRow("gap-before", "mixed-gaps", "gap", makeItem("8000000162", "污染昵称", "记录缺口：restart queue marker", true, "gap", gapDisplay))
+	appendRow("user-before", "mixed-gaps", "message", makeItem("8000000163", "Alice", "before message mentions 记录缺口 as ordinary text", false, "message", nil))
+	appendRow("gap-between", "mixed-gaps", "gap", makeItem("8000000164", "SeaDice记录系统", "记录缺口：queue hint", false, "gap", nil))
+	appendRow("bot-message", "mixed-gaps", "message", makeItem("8000000165", "机器人", "bot message", true, "message", nil))
+	appendRow("gap-after", "mixed-gaps", "gap", makeItem("8000000166", "记录缺口", "restart marker after chat", false, "gap", nil))
+	appendRow("user-after", "mixed-gaps", "message", makeItem("8000000162", "", "after [CQ:at,qq=999]", false, "message", &onebotBridgeLogDisplay{
+		AuthorAliases: []string{"openid:shared-human"},
+	}))
+	const gapOnlyGroupID = "QQ-Group:8000000000000168"
+	if _, err := service.OnebotBridgeLogNew(d.DBOperator, gapOnlyGroupID, "gap-only"); err != nil {
+		t.Fatal(err)
+	}
+	gapOnlyItem := makeItem("8000000167", "SeaDice记录系统", "记录缺口：only startup hint", false, "gap", nil)
+	if _, _, err := service.LogCaptureAppend(d.DBOperator, "gap-only-event", gapOnlyGroupID, "gap", gapOnlyItem); err != nil {
+		t.Fatal(err)
+	}
+
+	markdown, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "mixed-gaps", "md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	divs := regexp.MustCompile(`<div>(.*?)</div>`).FindAllStringSubmatch(string(markdown), -1)
+	if len(divs) != 3 || !strings.Contains(divs[0][1], "before message mentions 记录缺口 as ordinary text") || !strings.Contains(divs[1][1], "bot message") || !strings.Contains(divs[2][1], "after @成员") {
+		t.Fatalf("Markdown export should retain only the three real chat messages and anonymize gap-only targets: %#v\n%s", divs, markdown)
+	}
+	for _, hidden := range []string{"记录缺口：restart queue marker", "记录缺口：queue hint", "restart marker after chat", "SeaDice记录系统", "污染昵称", "@机器人"} {
+		if strings.Contains(string(markdown), hidden) {
+			t.Fatalf("Markdown export leaked hidden gap content or metadata %q: %s", hidden, markdown)
+		}
+	}
+	if !strings.Contains(string(markdown), "mentions 记录缺口 as ordinary text") {
+		t.Fatal("structured gap filtering removed an ordinary user message containing similar text")
+	}
+
+	plain, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "mixed-gaps", "txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainText := string(plain)
+	for _, real := range []string{"before message mentions 记录缺口 as ordinary text", "bot message", "after [CQ:at,qq=999]"} {
+		if !strings.Contains(plainText, real) {
+			t.Errorf("TXT export omitted real message %q: %s", real, plainText)
+		}
+	}
+	for _, hidden := range []string{"记录缺口：restart queue marker", "记录缺口：queue hint", "restart marker after chat", "SeaDice记录系统", "污染昵称"} {
+		if strings.Contains(plainText, hidden) {
+			t.Fatalf("TXT export leaked hidden gap content or metadata %q: %s", hidden, plainText)
+		}
+	}
+
+	for _, format := range []string{"md", "txt"} {
+		data, renderErr := onebotBridgeRenderLogSnapshot(d.DBOperator, gapOnlyGroupID, "gap-only", format)
+		if renderErr != nil {
+			t.Fatalf("%s gap-only export failed: %v", format, renderErr)
+		}
+		header, body, ok := strings.Cut(string(data), "\n\n")
+		wantHeader := "# gap\\-only"
+		if format == "txt" {
+			wantHeader = "日志：gap-only"
+		}
+		if !ok || strings.TrimSpace(body) != "" || header != wantHeader {
+			t.Fatalf("%s gap-only export should contain only a header: %q", format, data)
+		}
+	}
+}
+
+func TestOnebotBridgeSnapshotSkipsGapRowsBeforeSizeAndIndexGuards(t *testing.T) {
+	gapWriter := newOnebotBridgeLogSnapshotWriter(&strings.Builder{}, "md")
+	overLimitGap := &model.LogOneItem{
+		UniformID: "hidden-gap-identity", Nickname: strings.Repeat("n", onebotBridgeArtifactMaxBytes+1),
+		IMUserID: strings.Repeat("i", onebotBridgeArtifactMaxBytes+1), Message: strings.Repeat("m", onebotBridgeArtifactMaxBytes+1),
+		CommandInfo: map[string]interface{}{"bridgeCaptureKind": "gap", "bridgeDisplay": &onebotBridgeLogDisplay{
+			AuthorAliases: []string{"openid:hidden"}, Mentions: []onebotBridgeLogMention{{Target: "tinyid:123", IsBot: true}},
+		}},
+	}
+	if err := gapWriter.indexPage([]*model.LogOneItem{overLimitGap}); err != nil {
+		t.Fatalf("hidden gap should not enter or overflow the display index: %v", err)
+	}
+	if len(gapWriter.identities) != 0 || len(gapWriter.aliasParent) != 0 || len(gapWriter.authors) != 0 {
+		t.Fatalf("gap metadata polluted the display index: identities=%d aliases=%d authors=%d", len(gapWriter.identities), len(gapWriter.aliasParent), len(gapWriter.authors))
+	}
+	if err := gapWriter.writePage([]*model.LogOneItem{overLimitGap}); err != nil {
+		t.Fatalf("oversize hidden gap should not fail export: %v", err)
+	}
+
+	identityWriter := newOnebotBridgeLogSnapshotWriter(io.Discard, "md")
+	identityRows := make([]*model.LogOneItem, onebotBridgeLogDisplayMaxIdentities+1)
+	for index := range identityRows {
+		identityRows[index] = &model.LogOneItem{UniformID: fmt.Sprintf("real:%d", index), CommandInfo: map[string]interface{}{"bridgeCaptureKind": "message"}}
+	}
+	if err := identityWriter.indexPage(identityRows); !errors.Is(err, errOnebotBridgeLogDisplayIndexTooLarge) {
+		t.Fatalf("real rows should still enforce the identity cap: %v", err)
+	}
+
+	aliasWriter := newOnebotBridgeLogSnapshotWriter(io.Discard, "md")
+	var aliasRows []*model.LogOneItem
+	for itemIndex := range 157 {
+		mentions := make([]onebotBridgeLogMention, 64)
+		for mentionIndex := range mentions {
+			groupNumber := itemIndex*64 + mentionIndex
+			aliases := make([]string, 7)
+			for aliasIndex := range aliases {
+				aliases[aliasIndex] = fmt.Sprintf("openid:a%05d_%d", groupNumber, aliasIndex)
+			}
+			mentions[mentionIndex] = onebotBridgeLogMention{Target: fmt.Sprintf("tinyid:%d", groupNumber+1), Aliases: aliases}
+		}
+		aliasRows = append(aliasRows, &model.LogOneItem{
+			UniformID: "real:single-author", CommandInfo: map[string]interface{}{
+				"bridgeCaptureKind": "message", "bridgeDisplay": &onebotBridgeLogDisplay{Mentions: mentions},
+			},
+		})
+	}
+	if err := aliasWriter.indexPage(aliasRows); !errors.Is(err, errOnebotBridgeLogDisplayIndexTooLarge) {
+		t.Fatalf("real rows should still enforce the alias cap: %v", err)
 	}
 }
 
