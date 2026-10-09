@@ -179,6 +179,110 @@ func TestOnebotBridgeMarkdownBodyUsesSingleLineSpansAndPreservesText(t *testing.
 	}
 }
 
+func TestOnebotBridgeBotMarkdownRendersSafeRichHTMLAndKeepsLineBreaks(t *testing.T) {
+	d, _, _, cleanup := newExecuteNewTestDice(t)
+	defer cleanup()
+	logDB := d.DBOperator.GetLogDB(constant.WRITE)
+	if err := logDB.AutoMigrate(&model.LogInfo{}, &model.LogOneItem{}, &model.OnebotBridgeLogEvent{}, &model.OnebotBridgeLogState{}); err != nil {
+		t.Fatal(err)
+	}
+	const groupID = "QQ-Group:8000000000000135"
+	if _, err := service.OnebotBridgeLogNew(d.DBOperator, groupID, "bot-markdown"); err != nil {
+		t.Fatal(err)
+	}
+	firstBody := "**strong** and *italic*\n\n- one `inline`\n- [CQ:at,qq=cq-one]\n\n| left | right |\n| --- | --- |\n| [CQ:at,qq=cq-two] | b |\n\n```go\nline one\nline two\n```\n\n[@sdk](mqqapi://markdown/mention?at_type=1&at_tinyid=901) <@native> code `<@native>`\n\n<script>alert('x')</script>\n\n![remote alt](https://example.test/remote.png) [safe link](https://example.test/page) [unsafe](javascript:alert(1)) [@bad](mqqapi://markdown/mention?at_type=2&at_tinyid=999) [@dup](mqqapi://markdown/mention?at_type=1&at_type=1&at_tinyid=998)"
+	unclosedFenceBody := "plain line one\nplain line two\n\n```go\nunclosed code"
+	rawHTMLBody := "<section onclick=\"run()\">\n<script>\nattack()\n</script>\n</section>"
+	plainBody := "first\nsecond\nthird"
+	inlineHTMLBody := "before<span\n title=x data-user='<@z>'>after"
+	bodies := []string{firstBody, unclosedFenceBody, rawHTMLBody, plainBody, inlineHTMLBody}
+	for index, body := range bodies {
+		commandInfo := map[string]interface{}{"bridgeCaptureKind": "message"}
+		if index == 0 {
+			commandInfo["bridgeDisplay"] = &onebotBridgeLogDisplay{Mentions: []onebotBridgeLogMention{
+				{Target: "tinyid:901", Name: "SDK **literal**"},
+				{Target: "openid:native", Name: "Native *literal*"},
+				{Target: "openid:cq-one", Name: "CQ **one**"},
+				{Target: "openid:cq-two", Name: "CQ *two*"},
+			}}
+		}
+		item := &model.LogOneItem{
+			Nickname: "机器人", IMUserID: fmt.Sprintf("800000000000013%d", index+6),
+			UniformID: fmt.Sprintf("OneBotBridge:QQ:800000000000013%d", index+6),
+			Time:      1710000370 + int64(index), Message: body, IsDice: true, CommandInfo: commandInfo,
+		}
+		if _, _, err := service.LogCaptureAppend(d.DBOperator, fmt.Sprintf("bot-markdown-%d", index), groupID, "bot-markdown", item); err != nil {
+			t.Fatalf("append bot message %d: %v", index, err)
+		}
+	}
+
+	markdown, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "bot-markdown", "md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := string(markdown)
+	divs := regexp.MustCompile(`<div>(.*?)</div>`).FindAllStringSubmatch(output, -1)
+	if len(divs) != len(bodies) {
+		t.Fatalf("rendered %d bot body containers, want %d: %s", len(divs), len(bodies), output)
+	}
+	for index, div := range divs {
+		if strings.ContainsAny(div[1], "\r\n") {
+			t.Fatalf("bot body %d contains a physical source newline: %q", index, div[1])
+		}
+		if strings.Contains(div[1], "color:") {
+			t.Fatalf("bot body %d unexpectedly has inline color: %q", index, div[1])
+		}
+	}
+	rich := divs[0][1]
+	for _, expected := range []string{
+		"<strong>strong</strong>", "<em>italic</em>", "<ul>", "<code>inline</code>", "<table>",
+		"<pre><code class=\"language-go\">line one&#10;line two", "@SDK **literal**", "@Native *literal*",
+		"@CQ **one**", "@CQ *two*", "&lt;@native&gt;",
+		"&lt;script&gt;alert(", "&lt;/script&gt;", "[image: remote alt]", `href="https://example.test/page"`,
+	} {
+		if !strings.Contains(rich, expected) {
+			t.Errorf("rich bot Markdown body lacks %q: %s", expected, rich)
+		}
+	}
+	if strings.Contains(rich, "https://example.test/remote.png") || strings.Contains(rich, `href="javascript:`) || strings.Contains(rich, "<script>") {
+		t.Fatalf("image URL, unsafe link, or executable HTML reached the output: %s", rich)
+	}
+	if strings.Count(rich, "@Native *literal*") != 1 {
+		t.Fatalf("mention inside code span was rewritten or plain mention was missed: %s", rich)
+	}
+	if strings.Contains(rich, "@bad") || strings.Contains(rich, "@dup") || !strings.Contains(rich, "@成员") {
+		t.Fatalf("malformed mention targets used untrusted labels instead of anonymous names: %s", rich)
+	}
+	if strings.Count(divs[3][1], "<br>") != 2 || !strings.Contains(divs[3][1], "first<br>") || !strings.Contains(divs[3][1], "second<br>") {
+		t.Fatalf("plain bot newlines were not kept as visible line breaks: %s", divs[3][1])
+	}
+	if !strings.Contains(divs[4][1], `<span style="white-space:pre-wrap">&lt;span&#10;title=x data-user=&#39;&lt;@z&gt;&#39;&gt;</span>after`) ||
+		strings.Contains(divs[4][1], "<span\n") || strings.Contains(divs[4][1], "@成员") {
+		t.Fatalf("multiline inline RawHTML was not escaped with visible line breaks: %s", divs[4][1])
+	}
+	secondBody := "<div>" + divs[1][1] + "</div>"
+	secondBodyStart := strings.Index(output, secondBody)
+	secondBodyEnd := secondBodyStart + len(secondBody)
+	if !strings.Contains(divs[1][1], "<pre><code class=\"language-go\">unclosed code&#10;</code></pre>") ||
+		secondBodyStart < 0 || !strings.Contains(output[secondBodyEnd:], "### <span style=\"color:") {
+		t.Fatalf("unclosed fence did not end inside its own bot body: %s", output)
+	}
+	if !strings.Contains(divs[2][1], "<pre>&lt;section onclick=&#34;run()&#34;&gt;&#10;") ||
+		!strings.Contains(divs[2][1], "&lt;script&gt;") || !strings.Contains(divs[2][1], "&#10;") || strings.Contains(divs[2][1], "<script>") {
+		t.Fatalf("raw HTML block was omitted or left executable: %s", divs[2][1])
+	}
+
+	plain, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "bot-markdown", "txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range bodies {
+		if !strings.Contains(string(plain), body+"\n\n") {
+			t.Fatalf("TXT renderer changed bot message bytes for %q: %q", body, plain)
+		}
+	}
+}
+
 func TestOnebotBridgeMarkdownMarkupExpansionIsBounded(t *testing.T) {
 	d, _, _, cleanup := newExecuteNewTestDice(t)
 	defer cleanup()
@@ -201,6 +305,27 @@ func TestOnebotBridgeMarkdownMarkupExpansionIsBounded(t *testing.T) {
 	markdown, err := onebotBridgeRenderLogSnapshot(d.DBOperator, groupID, "markup-limit", "md")
 	if !errors.Is(err, errOnebotBridgeArtifactTooLarge) || markdown != nil {
 		t.Fatalf("oversized markup was not rejected without a partial artifact: len=%d err=%v", len(markdown), err)
+	}
+	botWriter := newOnebotBridgeLogSnapshotWriter(nil, "md")
+	if _, err := botWriter.renderBotMarkdownBody(strings.Repeat("&", 2_100_000), nil); !errors.Is(err, errOnebotBridgeArtifactTooLarge) {
+		t.Fatalf("expanded bot Markdown exceeded the output limit without an error: %v", err)
+	}
+}
+
+func TestOnebotBridgeBotMarkdownMentionExpansionBudgetIsCumulative(t *testing.T) {
+	const name = "名名"
+	w := newOnebotBridgeLogSnapshotWriter(nil, "md")
+	display := &onebotBridgeLogDisplay{Mentions: []onebotBridgeLogMention{{Target: "tinyid:budget", Name: name}}}
+	budget := len(name)*2 + 1
+	token := onebotBridgeLogMentionToken{aliases: []string{"tinyid:budget"}}
+	if _, err := w.resolveBotMarkdownMention(token, display, &budget); err != nil {
+		t.Fatalf("first mention should fit in the body budget: %v", err)
+	}
+	if budget != len(name) {
+		t.Fatalf("remaining budget = %d, want %d after @name literal", budget, len(name))
+	}
+	if _, err := w.resolveBotMarkdownMention(token, display, &budget); !errors.Is(err, errOnebotBridgeArtifactTooLarge) {
+		t.Fatalf("second repeated mention exceeded budget without rejection: %v", err)
 	}
 }
 

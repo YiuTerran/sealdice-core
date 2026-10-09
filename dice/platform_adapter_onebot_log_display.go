@@ -183,7 +183,13 @@ func (w *onebotBridgeLogSnapshotWriter) writePage(items []*model.LogOneItem) err
 			if item.IsDice {
 				row.WriteString(" · **bot**")
 			}
-			body, err := w.renderMarkdownBody(item.Message, itemDisplay, color)
+			var body string
+			var err error
+			if item.IsDice && kind != "gap" {
+				body, err = w.renderBotMarkdownBody(item.Message, itemDisplay)
+			} else {
+				body, err = w.renderMarkdownBody(item.Message, itemDisplay, color)
+			}
 			if err != nil {
 				return err
 			}
@@ -542,7 +548,7 @@ func (w *onebotBridgeLogSnapshotWriter) renderMarkdownLine(out io.StringWriter, 
 
 func onebotBridgeWriteEscapedHTML(out io.StringWriter, value string) error {
 	start := 0
-	for index := 0; index < len(value); index++ {
+	for index := range len(value) {
 		var entity string
 		switch value[index] {
 		case '&':
